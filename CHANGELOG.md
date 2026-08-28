@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.35.1] - 2026-08-28
+
+### Release Overview
+- My Skills can now be filtered and grouped by the specific import source of each skill, and presets export to every enabled agent by default.
+
+### User-facing
+- **Group and filter skills by source** — the My Skills view gains a source dropdown (multi-select, searchable) that filters by the exact import source (e.g. `mattpocock/skills` vs `obra/superpowers`), plus a group-by-source toggle that shows static section headers in both grid and list views. skills.sh skills that resolve to a GitHub repo merge into that repo's group; local/imported skills group by path.
+- **Preset export targets every enabled agent** (#400) — presets now sync to all enabled and installed agents instead of only the first three priority ones.
+
+### Developer & Governance
+- Added `src/lib/skillSource.ts` with pure helpers for source normalization and grouping.
 ## [1.35.0] - 2026-08-27
 
 ### Release Overview

@@ -5,6 +5,17 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.35.1] - 2026-08-28
+
+### 发布概览
+- My Skills 支持按技能的具体导入来源筛选与分组；预设默认导出覆盖全部已启用的 Agent。
+
+### 用户可见更新
+- **按来源筛选与分组**——My Skills 新增来源下拉（多选、可搜索，按具体来源筛选，如 `mattpocock/skills` 与 `obra/superpowers` 分开）与"按来源分组"开关，网格/列表视图均显示来源分组标题。解析到 GitHub 仓库的 skills.sh 技能并入该仓库组，本地/导入技能按路径分组。
+- **预设导出覆盖全部已启用 Agent**（#400）——预设现在同步到所有已启用且已安装的 Agent，不再只同步优先级前三。
+
+### 开发者与治理更新
+- 新增 `src/lib/skillSource.ts` 纯函数模块，负责来源归一化与分组。
 ## [1.35.0] - 2026-08-27
 
 ### 发布概览
