@@ -116,7 +116,7 @@ export function PresetBar({
   return (
     <div className="flex min-w-0 flex-wrap items-center gap-1.5">
       <span className="shrink-0 text-[12px] text-muted">{t("sidebar.presets")}</span>
-      <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto scrollbar-hide">
+      <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
         {visiblePresets.map((preset) => {
           const s = statuses.get(preset.id)!;
           const presetIcon = getPresetIconOption(preset);
