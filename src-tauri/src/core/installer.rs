@@ -134,6 +134,15 @@ pub fn hash_local_source(source: &Path) -> Result<String> {
     content_hash::hash_directory(prepared.skill_dir())
 }
 
+/// [`hash_local_source`] with CRLF folded to LF, for the "do these differ by
+/// anything other than line endings?" tiebreaker. Goes through the same
+/// [`PreparedSource`] so an archive source is answered the same way a
+/// directory source is.
+pub fn hash_local_source_eol_insensitive(source: &Path) -> Result<String> {
+    let prepared = PreparedSource::open(source)?;
+    content_hash::hash_directory_eol_insensitive(prepared.skill_dir())
+}
+
 pub fn install_from_git_dir(source: &Path, name: Option<&str>) -> Result<InstallResult> {
     install_from_local(source, name)
 }
@@ -355,6 +364,32 @@ mod tests {
 
         let dest = unique_skill_dest(tmp.path(), "legacy", &source).unwrap();
         assert_eq!(dest, tmp.path().join("legacy"));
+    }
+
+    /// An archive source is prepared by the same extraction, so the tiebreaker
+    /// has to answer for it exactly as it does for a directory: a CRLF archive
+    /// of the same skill is not an update. Covers the only source shape where
+    /// the comparison re-extracts rather than re-walking.
+    #[test]
+    fn eol_insensitive_hash_sees_through_an_archive_with_crlf_content() {
+        let tmp = tempdir().unwrap();
+        let archive = tmp.path().join("demo.skill");
+        write_skill_archive(&archive, "line one\r\nline two\r\n");
+
+        let extracted = tmp.path().join("extracted");
+        std::fs::create_dir_all(&extracted).unwrap();
+        std::fs::write(extracted.join("SKILL.md"), "---\nname: Demo Skill\n---\n").unwrap();
+        std::fs::write(extracted.join("body.md"), "line one\nline two\n").unwrap();
+
+        assert_ne!(
+            hash_local_source(&archive).unwrap(),
+            content_hash::hash_directory(&extracted).unwrap(),
+            "the byte hashes disagree, which is what sends the check to the tiebreaker"
+        );
+        assert_eq!(
+            hash_local_source_eol_insensitive(&archive).unwrap(),
+            content_hash::hash_directory_eol_insensitive(&extracted).unwrap()
+        );
     }
 
     fn write_skill_archive(path: &Path, body: &str) {

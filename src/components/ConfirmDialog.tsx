@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { X, AlertTriangle } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
@@ -26,6 +26,16 @@ export function ConfirmDialog({
   const { t } = useTranslation();
   const [loading, setLoading] = useState(false);
 
+  // Escape closes the dialog, except while the confirmed action is running.
+  useEffect(() => {
+    if (!open || loading) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, loading, onClose]);
+
   if (!open) return null;
 
   const handleConfirm = async () => {
@@ -39,9 +49,13 @@ export function ConfirmDialog({
   };
 
   return (
+    // The panel is capped so the footer buttons stay reachable (#430). The cap
+    // divides by --app-scale because the text-size setting applies `zoom` to
+    // <html> and zoom does not scale vh: a bare 85vh renders at 102% of the
+    // viewport on the largest size. Same compensation as html/body in index.css.
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative bg-surface border border-border rounded-xl w-full max-w-sm p-5 shadow-2xl">
+      <div className="relative bg-surface border border-border rounded-xl w-full max-w-sm p-5 shadow-2xl flex flex-col max-h-[calc(85vh/var(--app-scale))]">
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-[13px] font-semibold text-primary flex items-center gap-2">
             <AlertTriangle className="w-4 h-4 text-amber-400" />
@@ -54,7 +68,7 @@ export function ConfirmDialog({
 
         <p className="text-[13px] text-tertiary mb-5">{message}</p>
         {details && details.length > 0 ? (
-          <div className="mb-5 flex flex-wrap gap-2">
+          <div className="mb-5 flex flex-wrap gap-2 overflow-y-auto min-h-0">
             {details.map((detail) => (
               <span
                 key={detail}

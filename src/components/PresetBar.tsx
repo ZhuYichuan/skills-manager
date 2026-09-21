@@ -3,7 +3,7 @@ import { Check, Loader2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { cn } from "../utils";
-import { computePresetStatus } from "../lib/presetStatus";
+import { computePresetStatus, type PresetStatusMode } from "../lib/presetStatus";
 import { getPresetIconOption } from "../lib/presetIcons";
 import type { ManagedSkill, Preset } from "../lib/tauri";
 import { getErrorMessage } from "../lib/error";
@@ -16,6 +16,8 @@ export interface PresetBarProps {
   onAddSkill: (skill: ManagedSkill, agentKey: string) => Promise<void>;
   onRemoveSkill: (skill: ManagedSkill, agentKey: string) => Promise<void>;
   onComplete: () => Promise<void>;
+  /** Whether the status badge counts agent copies or logical skills. */
+  statusMode?: PresetStatusMode;
 }
 
 export function PresetBar({
@@ -26,6 +28,7 @@ export function PresetBar({
   onAddSkill,
   onRemoveSkill,
   onComplete,
+  statusMode = "agent-pair",
 }: PresetBarProps) {
   const { t } = useTranslation();
   const [loadingKey, setLoadingKey] = useState<string | null>(null);
@@ -33,10 +36,13 @@ export function PresetBar({
   const statuses = useMemo(() => {
     const map = new Map<string, ReturnType<typeof computePresetStatus>>();
     for (const preset of presets) {
-      map.set(preset.id, computePresetStatus(preset, managedSkills, agentKeys, existsInWorkspace));
+      map.set(
+        preset.id,
+        computePresetStatus(preset, managedSkills, agentKeys, existsInWorkspace, statusMode)
+      );
     }
     return map;
-  }, [presets, managedSkills, agentKeys, existsInWorkspace]);
+  }, [presets, managedSkills, agentKeys, existsInWorkspace, statusMode]);
 
   const visiblePresets = useMemo(
     () => presets.filter((p) => statuses.get(p.id)?.status !== "empty"),
@@ -116,7 +122,7 @@ export function PresetBar({
   return (
     <div className="flex min-w-0 flex-wrap items-center gap-1.5">
       <span className="shrink-0 text-[12px] text-muted">{t("sidebar.presets")}</span>
-      <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto scrollbar-hide">
+      <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
         {visiblePresets.map((preset) => {
           const s = statuses.get(preset.id)!;
           const presetIcon = getPresetIconOption(preset);

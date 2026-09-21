@@ -77,6 +77,20 @@ impl RepoLock {
         Self::acquire_blocking(operation, FOREGROUND_WAIT)
     }
 
+    /// Records who holds the lock, so a "repository is busy" report can be
+    /// traced back to the operation sitting on it.
+    ///
+    /// Deliberately not fsynced. Mutual exclusion comes from `flock`, never from
+    /// this file's contents, so a stamp lost to a crash costs nothing — whereas
+    /// `File::sync_all` is `fcntl(F_FULLFSYNC)` on macOS, which flushes the
+    /// whole APFS volume's cache and bills every page of it, including other
+    /// processes' dirty pages, to whoever called it. Phase B of
+    /// `check_all_skill_updates` takes this lock once per skill (deliberately —
+    /// see the comment there), so on a library of ~75 skills that was 75
+    /// whole-volume barriers per round: one hour of it was reported by the
+    /// system as 2.1 GB of "file backed memory dirtied", 24x over the
+    /// disk-writes limit, with the truncate and write above stalled behind the
+    /// same barriers.
     fn stamp(mut file: File, operation: &str) -> Result<Self> {
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
@@ -90,7 +104,6 @@ impl RepoLock {
             operation,
             chrono::Utc::now().to_rfc3339()
         )?;
-        file.sync_all()?;
         Ok(Self { file })
     }
 }
@@ -141,6 +154,44 @@ mod tests {
         assert!(
             entries.is_empty(),
             "skills_dir should remain empty while the lock is held; got {entries:?}"
+        );
+
+        drop(lock);
+        central_repo::set_test_base_dir_override(None);
+    }
+
+    /// The stamp is the only reason the lock file has contents at all, and it
+    /// is written without an fsync — so pin down that a separate reader still
+    /// sees it. `File` does no userspace buffering, so the `write` reaches the
+    /// page cache before `stamp` returns; losing it to a crash would be
+    /// harmless, but losing it to buffering would silently blank the one clue
+    /// a "repository is busy" report has.
+    ///
+    /// Unix only, and not for lack of trying: fs2 locks the whole byte range
+    /// with `LockFileEx`, whose locks are mandatory on Windows, so *no* handle
+    /// can read the file while the lock is held — the assertion below cannot be
+    /// expressed there. Asserting it after the release instead would pass
+    /// whether or not the write ever reached the file, which is no assertion at
+    /// all. The same mandatory lock means a Windows operator cannot read the
+    /// stamp of a live holder either, so there is less to protect.
+    #[cfg(unix)]
+    #[test]
+    fn stamp_is_readable_by_another_handle_while_held() {
+        let _guard = central_repo::test_base_dir_lock();
+        let tmp = tempdir().unwrap();
+        let base = tmp.path().join("base");
+        central_repo::set_test_base_dir_override(Some(base.clone()));
+
+        let lock = RepoLock::acquire("diagnosable operation").unwrap();
+
+        let stamped = std::fs::read_to_string(base.join(LOCK_FILE_NAME)).unwrap();
+        assert!(
+            stamped.contains(&format!("pid={}", std::process::id())),
+            "stamp should name the holding process; got {stamped:?}"
+        );
+        assert!(
+            stamped.contains("operation=diagnosable operation"),
+            "stamp should name the operation; got {stamped:?}"
         );
 
         drop(lock);

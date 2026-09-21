@@ -444,11 +444,13 @@ pub async fn get_source_skill_document(
         )
         .map_err(AppError::git)?;
 
-        let temp_dir = git_fetcher::clone_repo_ref(
+        let temp_dir = git_fetcher::clone_repo_ref_scoped(
             &git_source.clone_url,
             git_source.branch.as_deref(),
+            git_source.subpath.as_deref(),
             None,
             proxy_url.as_deref(),
+            None,
         )
         .map_err(AppError::classify_git_error)?;
 
@@ -641,11 +643,13 @@ pub async fn get_skill_source_diff(
         )
         .map_err(AppError::git)?;
 
-        let temp_dir = git_fetcher::clone_repo_ref(
+        let temp_dir = git_fetcher::clone_repo_ref_scoped(
             &git_source.clone_url,
             git_source.branch.as_deref(),
+            git_source.subpath.as_deref(),
             None,
             proxy_url.as_deref(),
+            None,
         )
         .map_err(AppError::classify_git_error)?;
 
@@ -958,9 +962,10 @@ pub async fn install_git(
                     )
                     .ok();
             });
-            let temp_dir = git_fetcher::clone_repo_ref_with_progress(
+            let temp_dir = git_fetcher::clone_repo_ref_scoped(
                 &parsed.clone_url,
                 parsed.branch.as_deref(),
+                parsed.subpath.as_deref(),
                 Some(&cancel),
                 proxy_url.as_deref(),
                 Some(progress_cb),
@@ -1145,9 +1150,10 @@ pub async fn preview_git_install(
                 )
                 .ok();
         });
-        let temp_dir = git_fetcher::clone_repo_ref_with_progress(
+        let temp_dir = git_fetcher::clone_repo_ref_scoped(
             &parsed.clone_url,
             parsed.branch.as_deref(),
+            parsed.subpath.as_deref(),
             Some(&cancel),
             proxy_url.as_deref(),
             Some(progress_cb),
@@ -1905,11 +1911,13 @@ pub fn update_git_skill_internal(
         .update_skill_update_status(skill_id, "updating")
         .map_err(AppError::db)?;
 
-    let temp_dir = git_fetcher::clone_repo_ref(
+    let temp_dir = git_fetcher::clone_repo_ref_scoped(
         &git_source.clone_url,
         git_source.branch.as_deref(),
+        git_source.subpath.as_deref(),
         cancel,
         proxy_url,
+        None,
     )
     .map_err(AppError::classify_git_error)?;
     let update_result = (|| -> Result<UpdateOutcome, AppError> {
@@ -2158,9 +2166,15 @@ pub fn set_git_source_internal(
         git_fetcher::resolve_remote_revision(&parsed.clone_url, branch.as_deref(), proxy_url)
             .map_err(|e| AppError::git(e.to_string()))?;
 
-    let temp_dir =
-        git_fetcher::clone_repo_ref(&parsed.clone_url, branch.as_deref(), None, proxy_url)
-            .map_err(AppError::classify_git_error)?;
+    let temp_dir = git_fetcher::clone_repo_ref_scoped(
+        &parsed.clone_url,
+        branch.as_deref(),
+        subpath.as_deref(),
+        None,
+        proxy_url,
+        None,
+    )
+    .map_err(AppError::classify_git_error)?;
 
     // Nothing before this point has written to the store, so a failure during
     // the network phase leaves no state to unwind — in particular the skill is
@@ -2605,13 +2619,7 @@ pub fn check_skill_update_internal_with_remote(
                         )
                     } else {
                         match installer::hash_local_source(source_path) {
-                            Ok(live_hash) => match skill.content_hash.as_deref() {
-                                Some(stored) if stored == live_hash.as_str() => {
-                                    ("up_to_date", None)
-                                }
-                                Some(_) => ("update_available", None),
-                                None => ("local_only", None),
-                            },
+                            Ok(live_hash) => local_source_status(&skill, source_path, &live_hash),
                             Err(err) => ("error", Some(err.to_string())),
                         }
                     }
@@ -2630,6 +2638,52 @@ pub fn check_skill_update_internal_with_remote(
     }
 
     managed_skill_by_id(store, skill_id)
+}
+
+/// Classify a `local`/`import` skill against its freshly hashed source.
+fn local_source_status(
+    skill: &SkillRecord,
+    source: &Path,
+    live_hash: &str,
+) -> (&'static str, Option<String>) {
+    match skill.content_hash.as_deref() {
+        None => ("local_only", None),
+        Some(stored) if stored == live_hash => ("up_to_date", None),
+        // The byte hashes disagree. Before offering an update, rule out the one
+        // difference that is not one — see [`differs_only_by_line_endings`].
+        Some(_) if differs_only_by_line_endings(source, Path::new(&skill.central_path)) => {
+            ("up_to_date", None)
+        }
+        Some(_) => ("update_available", None),
+    }
+}
+
+/// True when the original source and the library copy hold the same content in
+/// two line-ending encodings, and nothing else.
+///
+/// A `local`/`import` skill is checked by hashing the user's own source path,
+/// which is theirs to keep however they like — commonly a git working tree.
+/// Git for Windows defaults to `core.autocrlf=true`, so on a Windows + macOS
+/// pair the same checkout is CRLF on one machine and LF on the other while the
+/// library copy (our own byte copy, or a copy synced from the other machine)
+/// keeps the other encoding. Byte hashes then disagree forever and the skill
+/// sits at "update available"; re-importing rewrites the library in the local
+/// encoding, the other machine sees *its* copy drift, and the two devices push
+/// the same skill back and forth. Nothing changed, so nothing should be offered.
+///
+/// Deliberately compares the two live trees rather than the stored hash: the
+/// stored hash answers "what did we install?", and the question here is "do
+/// these two directories differ right now?". Any failure to read either side
+/// answers `false`, leaving the byte-hash verdict standing — this may only ever
+/// suppress a false update, never assert sameness it could not establish.
+fn differs_only_by_line_endings(source: &Path, central: &Path) -> bool {
+    let (Ok(source_hash), Ok(central_hash)) = (
+        installer::hash_local_source_eol_insensitive(source),
+        crate::core::content_hash::hash_directory_eol_insensitive(central),
+    ) else {
+        return false;
+    };
+    source_hash == central_hash
 }
 
 fn should_skip_update_check(
@@ -3768,6 +3822,87 @@ mod tests {
             "no revision from a stale remote"
         );
         assert_eq!(stored.last_checked_at, None, "the check did not complete");
+    }
+
+    /// Insert a `local` skill whose library copy is `central_body` and whose
+    /// original source path holds `source_body`, with the stored hash recorded
+    /// from the library copy exactly as an install would leave it.
+    fn insert_local_skill(repo: &TestRepo, id: &str, central_body: &str, source_body: &str) {
+        let central = central_repo::skills_dir().join(id);
+        fs::create_dir_all(&central).unwrap();
+        fs::write(central.join("SKILL.md"), central_body).unwrap();
+
+        let source = repo._tmp.path().join(format!("{id}-source"));
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("SKILL.md"), source_body).unwrap();
+
+        let mut skill = sample_skill(id, id, &central);
+        skill.source_type = "local".to_string();
+        skill.source_ref = Some(source.to_string_lossy().to_string());
+        skill.content_hash = Some(crate::core::content_hash::hash_directory(&central).unwrap());
+        skill.update_status = "unknown".to_string();
+        repo.store.insert_skill(&skill).unwrap();
+    }
+
+    /// Drives the real check, because the wiring is where this can go wrong:
+    /// the tiebreaker can be correct and still never be consulted. A Windows
+    /// checkout of the same skill is CRLF while the library copy synced from a
+    /// Mac is LF — byte hashes disagree, but there is no update to offer, and
+    /// offering one starts a re-import ping-pong between the two machines.
+    #[test]
+    fn a_local_source_that_differs_only_in_line_endings_is_up_to_date() {
+        let repo = test_repo();
+        insert_local_skill(
+            &repo,
+            "skill-1",
+            "---\nname: skill-1\n---\nbody\n",
+            "---\r\nname: skill-1\r\n---\r\nbody\r\n",
+        );
+
+        let dto =
+            check_skill_update_internal_with_remote(&repo.store, "skill-1", true, None).unwrap();
+
+        assert_eq!(dto.update_status, "up_to_date");
+    }
+
+    /// A vanished library copy still has an update to offer. This is a
+    /// regression guard on the end-to-end path, not proof of the empty-tree
+    /// guard itself — a non-empty source cannot collide with an empty library,
+    /// so what pins that collision is
+    /// `content_hash::tests::an_empty_or_missing_directory_has_no_tiebreaker_hash`.
+    #[test]
+    fn a_missing_library_copy_is_not_up_to_date() {
+        let repo = test_repo();
+        insert_local_skill(
+            &repo,
+            "skill-1",
+            "---\nname: skill-1\n---\nbody\n",
+            "---\r\nname: skill-1\r\n---\r\nbody\r\n",
+        );
+        fs::remove_dir_all(central_repo::skills_dir().join("skill-1")).unwrap();
+
+        let dto =
+            check_skill_update_internal_with_remote(&repo.store, "skill-1", true, None).unwrap();
+
+        assert_eq!(dto.update_status, "update_available");
+    }
+
+    /// The other half of the same wiring: the tiebreaker must not swallow a
+    /// real edit. Without this, "always up to date" would pass the test above.
+    #[test]
+    fn a_local_source_with_a_real_edit_still_reports_an_update() {
+        let repo = test_repo();
+        insert_local_skill(
+            &repo,
+            "skill-1",
+            "---\nname: skill-1\n---\nbody\n",
+            "---\r\nname: skill-1\r\n---\r\nbody, rewritten\r\n",
+        );
+
+        let dto =
+            check_skill_update_internal_with_remote(&repo.store, "skill-1", true, None).unwrap();
+
+        assert_eq!(dto.update_status, "update_available");
     }
 
     /// A remote that failed to resolve off the lock still has to land as an

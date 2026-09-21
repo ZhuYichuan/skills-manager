@@ -5,6 +5,160 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.40.0] - 2026-09-17
+
+### Release Overview
+- Adding skills in bulk, a project workspace that counts each skill once, and an end to the disk thrashing the update check caused on macOS.
+
+### User-facing
+- **Add skills in bulk** — The Add Skills sheet gains Select all / Deselect all and Shift+click range selection, with a count of what is selected. Setting up a new project meant clicking every skill individually; enabling 10–30 at once is now two clicks. Only skills that are actually addable in the current filtered view are touched. Thanks to @ZhuYichuan (#428).
+- **A project workspace now counts each skill once** — A repository that ships several skills was miscounted: the same skill deployed to three agents counted as three, and sync health was tallied per copy rather than per skill. Worse, matching a project copy back to its library skill scored the candidates and took the highest, so a tie was broken arbitrarily — two skills with identical content could bind a copy to the wrong one and show a sync status belonging to another skill. Copies are now grouped before counting, with a group reporting the most severe status it carries, and the match resolves in layers, refusing to guess when a layer leaves more than one candidate. Thanks to @lijianqiang12 (#267, #262).
+- **macOS: checking all updates no longer thrashes the disk** — Every acquisition of the central repository lock fsynced its stamp file, which on macOS flushes the whole volume's cache and bills every dirty page in it — including other processes' — to this app. The update check takes that lock once per skill by design, so a library of ~75 skills issued 75 whole-volume barriers per round; one hour of it was reported by the system as 2.1 GB of "file backed memory dirtied", 24x over the disk-writes limit. The stamp exists only to name the operation holding the lock, and mutual exclusion comes from `flock`, never from the file's contents.
+- **A non-Chinese interface no longer falls back to Chinese** — Any string without a translation in the selected language showed Simplified Chinese. English is the fallback everywhere now, except Traditional Chinese, which still falls back to Simplified. Thanks to @jonathanleiva15 (#394).
+- **Fixed: Shift+clicking a range painted the rows' text in highlight blue**, because the browser extends its own text selection from the previous click. The picker rows are click targets rather than prose, so they now opt out of text selection.
+
+### Developer & Governance
+- The Vite dev server no longer watches `src-tauri/target`, where a single `cargo build` produced tens of thousands of file events and stalled hot reload. Thanks to @loeanxi (#397).
+- Two defects were found reviewing #267 before release. The new layered match put the central directory name above the content hash, so a library holding both `Code Review` and `code-review` bound the first one's export — written under the slug `code-review` — to the second one's row; since importing a project copy back installs into the matched row's directory, that would have overwritten the other skill. A hash identifying exactly one skill is now consulted right after `source_ref`, while several skills sharing a hash still fall through to the directory and name layers, so #267's own fix is untouched. Separately, a preset with copies on some but not all of a project's agents reported as never applied rather than partially applied.
+- The comments #267 added were translated to English, matching the rest of the codebase.
+## [1.39.0] - 2026-09-15
+
+### Release Overview
+- Preset chips wrap instead of being cut off, and line endings alone no longer make a skill look out of date. Also adds GitLab Duo as a built-in agent, and fixes two bugs that could leave you stuck: a confirmation dialog whose buttons scrolled off screen, and imported skills that permanently reported a missing source.
+
+### User-facing
+- **Preset chips now wrap instead of being cut off** — With more than about nine presets the row overflowed the window and the ones past the edge could not be reached with a mouse at all. They now wrap onto as many lines as they need, so every preset stays visible and clickable. Thanks to @ZhuYichuan (#447, #341).
+- **Skills no longer sit at "update available" forever on a Windows + macOS pair** — A skill imported from a local folder is compared against that folder byte for byte, and Git for Windows converts line endings on checkout by default. The same skill is therefore CRLF on one machine and LF on the other, the comparison never matched, and re-importing only rewrote the library in the local encoding — so the two machines pushed the same skill back and forth, each seeing an update the other had just "made". Line endings alone no longer count as a difference. Everything else still does: a file the comparison cannot read, a directory it cannot enter, and content that is not valid UTF-8 all keep their byte-exact treatment rather than being assumed to match, and the stored identity of a skill is unchanged. Thanks to @WingSky2022 (#440).
+- **GitLab Duo is now a built-in agent** (54 supported out of the box). It deploys to `~/.gitlab/duo/skills` and also discovers skills in the shared `~/.agents/skills` root. **On Windows, set the skills directory manually**: GitLab Duo reads `%APPDATA%\GitLab\duo\skills`, which this release does not detect automatically, so Duo will otherwise show as not installed. (#433)
+- **Fixed: the update confirmation dialog could not be dismissed when it listed many files.** Updating a skill whose new version drops a lot of files grew the dialog past the top and bottom of the window, with no scrollbar and both buttons off screen. The dialog now caps its height and scrolls the file list instead, at every text size. (#430)
+- **Fixed: an imported skill could permanently report "source missing" after its source directory was adopted.** When the agent directory a skill was imported from got turned into a managed deployment, removing that deployment orphaned the skill's source — update checks then failed forever even though the central copy was intact. The source is now re-pointed at the central copy before the replacement happens. A skill whose source is reached through a symlink is left alone, since the symlink is only unlinked and the real folder survives. (#425)
+
+### Developer & Governance
+- The byte hash `hash_entries` is untouched and remains every skill's stored identity. The line-ending comparison is a separate, stricter function consulted only when two byte hashes already disagree, so no stored hash is invalidated and no migration is needed.
+- `npm run release:prepare` now syncs `package-lock.json` alongside `package.json`. Its version field had been stale at 1.22.1 while the app was at 1.38.0, so every contributor's `npm install` produced a stray diff.
+- Corrected the GitLab Duo adapter's path comment, which described the Windows location correctly and then claimed the Unix path applied everywhere but the `XDG_CONFIG_HOME` / `GLAB_CONFIG_DIR` cases — omitting Windows itself.
+## [1.38.0] - 2026-09-08
+
+### Release Overview
+- Installing one skill out of a large repository now downloads that skill, not the repository.
+
+### User-facing
+- Installing or updating a skill whose source names one skill directory now fetches only that directory, using a partial clone and a sparse checkout. Installing `mcp-builder` out of `anthropics/skills` went from 15 MB to 472 KB of cache on disk. Skills from the same repository share one cache, so the second one costs only its own files. Anything that can go wrong here — a server that refuses partial clones, a git too old to read the arguments the way we mean them, a subdirectory upstream has since moved, a source that names a folder of skills rather than one skill — falls back to the full checkout, so this can only make an install faster, never make it fail.
+- A configured proxy no longer defeats the repository cache. The cache refresh passed the proxy setting to `git fetch` in a position git rejects outright, so for proxy users the refresh failed every time and every install and update re-cloned the whole repository from scratch. A proxy changed after a repository was first cached is now picked up too.
+- Cancelling an install no longer throws away a healthy repository cache, which used to make the next install download everything again.
+- The repository cache is now bounded. Nothing ever deleted an entry before, so it grew by one checkout per repository forever — 569 MB across 48 repositories on an ordinary machine, the oldest untouched for four months. Above 1 GB the least recently used repositories are dropped; they are re-downloaded only if that skill is installed or updated again. A repository another install is working on is skipped, never deleted underneath it.
+
+### Developer & Governance
+- `clone_repo_ref_scoped` is the single clone entry point; the narrow path is taken only when the caller names one skill directory. Preview with no subpath, skills.sh locator installs, `resolve_skill_dir`'s repo-wide fallback and any container subpath all still get a whole tree from a separate cache slot, so the flows that search a repository are untouched.
+- The narrow guard requires the subpath to be a skill, not merely to contain one. A container would otherwise pass while leaving `resolve_skill_dir`'s locator search on a one-directory tree, where it does not fail cleanly — it can resolve a different skill that happens to be in scope.
+- A narrow checkout is materialized by copying the cache, not by `git clone --local`: cloning from a partial clone makes the source serve objects it does not have and aborts with "could not fetch <oid> from promisor remote".
+- `sparse-checkout set` succeeds on a path the repository does not have, simply leaving it absent, so the result is inspected for an actual skill before it is used. Subpaths are never tidied up before being handed to git: on unix a trailing space or a backslash is a legal part of a directory name, so rewriting one would narrow to a neighbour and pass the guard while the caller read a path the checkout lacks.
+- The cache-side `sparse-checkout`, `checkout` and `reset --hard` all fetch blobs over the network in a partial clone, so they carry the clone's timeout, cancel flag and current proxy.
+- An install checkout is detached from its promisor remote before it leaves this module, so it is not a partial clone. This is what keeps the narrow clone from taxing every future change: callers run plain `git` against the checkout, and without the detach any command reaching an unfetched object would silently become a network round trip that can hang. Detached, a missing object is an immediate error — exactly as in the shallow full checkout that came before. The precise claim is that nothing fetches behind a caller's back; an explicit `fetch` or `pull` against origin would still use the network, and no caller does that. Three settings can register a promisor remote, so all three are cleared, and one of the tests asserts the outcome over a real `file://` partial clone rather than the names of the settings.
+
+## [1.37.1] - 2026-09-07
+
+### Release Overview
+- Toolbar fixes in the library, the global and lobster workspaces, and project pages: multi-select moves into the main toolbar, and the library toolbar stops breaking its own labels apart at narrow widths.
+
+### User-facing
+- The library toolbar no longer wraps its filter labels mid-word. Below roughly 1100px of toolbar width the segmented buttons collapsed to one character per line and the search field was squeezed from 280px down to 65px. Entering select mode made it visible rather than causing it: the longer "Cancel selection" label pushed an already borderline row over the edge. Segmented labels now stay on one line on every page, and the number of toolbar rows no longer changes when you toggle select mode.
+- Multi-select now shares the right-hand toolbar border with the backup, update, refresh and view controls, the same way in the library, the global and lobster workspaces, and project pages. A divider separates the view controls from selection mode, while the labelled selection button keeps its independent active state.
+
+### Developer & Governance
+- `.app-segmented-button` carries `whitespace-nowrap`, so a segmented label can no longer break on any page. `ProjectDetail` and `WorkspaceView` already pinned their segmented controls with `shrink-0`; `MySkills` was the only view missing it.
+
+## [1.37.0] - 2026-09-06
+
+### Release Overview
+- Batch operations reworked: bulk sync to agents, bulk removal in the global and lobster workspaces, and two selection defects that made the buttons act on more than they said.
+
+### User-facing
+- Selecting skills and then changing a filter no longer leaves an invisible selection behind. Selecting ten skills, switching to another tag and pressing delete used to act on the nine that had scrolled out of the filter. The selection is now trimmed to what is on screen when the filter changes, and cleared when you switch project or agent.
+- The enable/disable button now counts what it will actually change. With 23 of 30 selected skills already enabled, it said "Enable 30" and then reported "7 enabled".
+- New: sync a batch of skills to one or more agents from the library, instead of opening each skill's detail panel. The dialog shows how many of the selection each agent already has, and only adds the missing ones.
+- New: select mode in the global and lobster workspaces, which had none. "Remove" is kept as two separate buttons there, because it means two different things: unsyncing a managed skill leaves the central copy intact, while deleting a local-only skill cannot be undone. Both confirmations list the affected skills by name.
+- Bulk tag edits and enable/disable now show progress and cannot be triggered twice by accident.
+- The toolbar keeps update and delete in the "…" menu, so the buttons on screen are the ones you reach for; delete no longer carries the same visual weight as an everyday action.
+- The select-mode entry moved out of the grid/list switcher, where it read as a third view, and now has a label.
+- Escape leaves select mode, and also closes the confirmation, tag and sync dialogs, which previously ignored it.
+- Editing tags from a project now says that tags live in the central library and reach every project using those skills.
+- Toolbar controls line up: search field, segmented controls and buttons were 36, 38, 40 and 42px tall next to each other, and are now all 40px. The Add Skill button also picks up the app's standard primary-button colouring.
+
+### Developer & Governance
+- `MultiSelectToolbar` takes an action list with three tones instead of twenty business-specific props, which is what makes the overflow menu and the workspace's two removal semantics expressible without a fourth variant.
+- `useMultiSelect` adjusts the selection during render rather than in an effect, per React's guidance and eslint's `react-hooks` rules, and derives the live selection from the current items so a deleted key cannot re-select a later item that reuses its path.
+- Toolbar sizing moved into `.app-toolbar-segmented` / `.app-toolbar-button` component classes; the sky, violet, amber and red-600 literals in the bulk toolbar and `CardActionMenu` were replaced with the repo's own tokens.
+- A set of workspace i18n keys that had been unreferenced since an earlier refactor is in use again for the bulk removal flow.
+## [1.36.2] - 2026-09-05
+
+### Release Overview
+- Two git source fixes: a skill pinned to a tag no longer fails its update check forever, and skills hosted on a private repository work in the desktop app.
+
+### User-facing
+- A skill installed from a tag (`.../tree/v1.2.3/...`) no longer shows a permanent "check failed" badge. Installation always accepted a tag, but the update check looked for a branch of that name and never found one, so the failure could not be cleared by retrying.
+- Skills on a private repository can now be checked and installed from the desktop app. They previously failed with libgit2's own wording — "remote authentication required but no callback set" — while the same skills worked from the CLI, because the app never handed git a way to obtain credentials. Credentials now come from the app's keychain entry, your git credential helper (osxkeychain, Git Credential Manager, libsecret), or ssh-agent.
+- When no credentials are available, the message says which host needs a sign-in instead of quoting a libgit2 error code.
+- A tag source no longer re-downloads its repository on every update check.
+- The skill detail panel labelled the source ref "Branch" even when it held a tag; it now reads "Branch / Tag".
+
+### Developer & Governance
+- Both revision resolvers match refs by exact name across `refs/heads` and `refs/tags`, preferring a branch, then an annotated tag's peeled commit, then the tag object. Taking the first line of `ls-remote` output would have adopted an annotated tag's object sha and reported an update on every check.
+- Tree-URL disambiguation lists tags as well as heads, matched in a second pass so a tag cannot claim a URL a branch explains.
+- The git2 clone fallback can check out a tag: it inits an empty repository and shallow-fetches the tag ref, rather than cloning the default branch first.
+- All three git2 network entry points in `git_fetcher` install credentials, not just the one the bug report named — the two clone paths meant a private source could be diagnosed but not installed. The keychain is read from inside the callback, so a public source no longer touches it at all.
+- The backup engine (`git2_engine`) is deliberately untouched; it has its own credentials path already in production.
+- New tests cover ref ordering, annotated vs lightweight tags, branch-beats-tag disambiguation, and the credentials callback. Three network-dependent tests are ignored by default; one of them empties PATH to exercise the fallback on a machine with no git.
+## [1.36.1] - 2026-09-03
+
+### Release Overview
+- Applying a preset in a project reaches every agent you have enabled, and the Windows installer no longer flashes a console window on the first launch after an install.
+
+### User-facing
+- **A project preset now reaches all of your agents** — Applying a preset inside a project only ever deployed to Claude Code, Codex, Cursor, Gemini CLI and GitHub Copilot, and to at most three of them. Every other agent — Pi, ZCode, DeepSeek Harness, Kimi, and the rest — was dropped without a word, which is why disabling Claude Code and Codex made the others start working. Priority now only decides the order; every installed and enabled agent is included. Thanks to @ZhuYichuan for the diagnosis and the fix (#400, #403).
+- **A stale hidden preference no longer narrows that list** — An older version had a "save default agents" button whose setting outlived the button. If you ever used it, your projects kept deploying to that frozen subset, with nothing in the interface to show it or change it — so the fix above would not have reached you. That leftover setting is now removed on upgrade.
+- **The preset bar waits for your real agent list** — Opening a project and clicking a preset before its agent list finished loading could deploy to Claude Code alone. The bar now appears once the real list has arrived.
+- **No more console window flashing on Windows** — The helper that publishes the bundled command-line tool ran without hiding its window, so a black console appeared and vanished on the first launch after every install (#413).
+
+### Developer & Governance
+- `cli_bridge` routes its `--version` verification through a constructor that sets `CREATE_NO_WINDOW`, the flag every other spawn in the crate already used. It is named so a future spawn here has somewhere obvious to go.
+- Migration v7→v8 deletes the orphaned `project_default_export_agents` row. It tolerates a database with no settings table rather than failing an upgrade over a cleanup, and is covered by a test verified to fail when the delete is removed.
+- `getDefaultExportAgents` is now a pure function of the project's agent targets, and `presetBarAgentKeys` holds the bar back until those targets have actually loaded rather than deriving from the claude_code-only stand-in.
+- A batching change to preset application was reverted before release: cross-vendor review found it misreported per-agent outcomes, since only the backend's validation pass is all-or-nothing while its write loop is not.
+## [1.36.0] - 2026-08-29
+
+### Release Overview
+- Your coding agents can now drive Skills Manager themselves — installing, updating and deploying skills on your behalf, through the same library and sync engine the app uses.
+
+### User-facing
+- **Let your agents manage skills** — Claude Code, Codex, Cursor and the rest can now install a skill, deploy it to another agent, or report what is where, by driving Skills Manager rather than writing into an agent's folder behind its back. Sources, preset membership, update tracking and per-agent deployment state all stay intact. The Dashboard offers a one-time setup: pick which agents should be able to do it, and the app installs the `manage-skills` skill and deploys it to exactly those. Nothing is pre-selected, and the prompt disappears for good once you have acted on it or dismissed it — afterwards it is an ordinary library skill, managed from the agent badges on its own card.
+- **The CLI is where agents can find it** — The command-line tool has always shipped inside the desktop app, but on macOS it sat inside the `.app` and on Windows inside the install directory, where nothing could reach it. The app now keeps a copy at `~/.skills-manager/bin/`, refreshed on every launch, so agents can use it without anything being added to your PATH. On Linux the `.deb` and `.rpm` already placed it on PATH and still do.
+- **A refused deployment now says which directory is in the way** — When a deploy would overwrite something Skills Manager does not own, it refuses and leaves your content untouched. Until now the reason arrived as one long sentence, so an agent asked to do the deployment could only read it back to you. It now carries the actual path, which means your agent can name the directory, confirm nothing in it was deleted, and offer to import it into the library or move it aside.
+
+### Developer & Governance
+- New `core/cli_bridge.rs` publishes the bundled CLI to `~/.skills-manager/bin/` off the main thread at startup. A copy rather than a symlink: an AppImage is mounted at a temporary path, Windows reserves symlink creation for administrators, and a relocated `.app` would leave a dangling link. The location is the home directory rather than `central_repo::base_dir()`, which the user can move.
+- A `.version` stamp is written last and removed first, and gates the copy: a stale bridge can be a binary that predates the #363 fix and so deletes user directories a current one refuses to touch, which the database's own `user_version` gate cannot catch because such a fix carries no migration. Invalidation has three fallbacks — unlink, truncate, remove the binary itself — so a locked or read-only stamp on Windows cannot leave the pair vouching for itself; when none can take effect the publish is abandoned rather than run with a stamp that lies. The copy is verified by running `--version` with whole-token equality before it is published.
+- `AppError` gains an optional `details`, omitted from the wire format when absent, and an `ErrorKind::TargetConflict` that the CLI emits as a `TARGET_CONFLICT` envelope carrying `conflicts[].path`. Only an ownership refusal is classified that way: two library skills planning onto one path stays `InvalidInput`, and a target that cannot be inspected is `Io`, since telling a caller to adopt or move content that may not exist is worse than no advice. The refusal wording now has a single definition so the sentence and the structured form cannot drift.
+- The bundled `manage-skills` skill resolves the CLI before anything else, preferring the published copy over whatever is on PATH — a hand-installed binary is often several releases behind while writing the same database. Resolution yields a path to substitute into later commands rather than a shell variable, because each command an agent runs is a new process. An unstamped binary, or a stamp with no binary, stops the skill rather than sending it looking for something that may be older still.
+- Both READMEs now carry the skills.sh badge and the `npx skills add` line, so the skill has an entry point for people who never open the app.
+
+## [1.35.1] - 2026-08-28
+
+### Release Overview
+- In a project with two agents, an edit made under the second one could not reach the Skills Center, and following the status the app then showed would overwrite that edit. Fixed, together with the cases where no push is safe at all.
+
+### User-facing
+- **An edit under any agent now reaches the center** (#327) — A project skill exists once per agent directory and the card aggregates them. The card lit "update to center" if *any* copy was edited, but pushed the copy whose agent name sorted first. Editing under Codex while Claude Code was also configured therefore pushed the untouched Claude copy: the toast said success, nothing of the edit arrived, and the freshly written center then read as newer — so following the card to "update to project" destroyed the edit. The copy that actually carries the edit is pushed now, and the others are realigned from the center afterwards so the card settles instead of flipping. Thanks to @enshulv. Fixes #322.
+- **When no copy can be shown to be safe, nothing is written** — If more than one copy of a skill is anything other than in sync with the center, the update is refused and the conflict is named, rather than picking one and silently stranding the rest. Only "in sync" proves a copy holds nothing of its own: it is a content match, while "center is newer" is decided by timestamp *after* the contents already differed, so such a copy can hold work that a pull would destroy. **This is stricter than before**: two agents each holding their own not-yet-imported copy of the same skill now have to be reconciled into one before the center will accept it.
+
+### Developer & Governance
+- `classify_sync_status` returns `center_newer` only after the content hashes differ, then picks a side by mtime — it is not proof that the project copy is redundant. The realign step treated it as proof, and the refusal threshold was drawn at "edited" rather than "not provably clean"; both let a copy holding unique content be overwritten by a later action the card itself offered.
+- Pushing rebuilds the center directory, moving its mtime to now, which is what turned every stranded copy into `center_newer` — a status whose only remaining card action overwrites all variants, and which the backend's guard does not refuse (it refuses `project_newer` only). That chain, not the push itself, was the data-loss path.
+- Sibling realignment runs serially. Two agents' skills roots can be symlinks onto one directory, and each realign rebuilds its target, so concurrent calls on one path failed for no real reason and the batch counted it as a failure.
+- Three rounds of cross-vendor review; the substantive defects stopped appearing after the second. Widening the refusal made the bookkeeping it was working around unreachable, so the change ends 38 lines shorter than its first draft.
+- Known and unfixed: if two agents' skills roots are symlinks onto one directory, one physical skill scans as two edited copies and the refusal cannot be resolved by editing files. Collapsing roots by canonical path is a scanner change, deliberately not made here.
+- These are frontend-only changes and the repo has no frontend test runner, so `test.yml` does not cover them. Verification was `lint`, `build`, and review.
+
 ## [1.35.0] - 2026-08-27
 
 ### Release Overview

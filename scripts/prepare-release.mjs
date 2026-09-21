@@ -17,6 +17,7 @@ if (!releaseArg) {
 const dateStr = new Date().toISOString().slice(0, 10);
 
 const packagePath = path.join(root, 'package.json');
+const packageLockPath = path.join(root, 'package-lock.json');
 const tauriConfPath = path.join(root, 'src-tauri', 'tauri.conf.json');
 const cargoTomlPath = path.join(root, 'src-tauri', 'Cargo.toml');
 const cargoLockPath = path.join(root, 'src-tauri', 'Cargo.lock');
@@ -142,6 +143,14 @@ function main() {
   const nextVersion = bumpVersion(currentVersion, releaseArg);
 
   pkg.version = nextVersion;
+  // npm rewrites both of these on any install, so leaving them behind means
+  // every contributor's `npm install` produces a stray diff. They sat at
+  // 1.22.1 while package.json was 1.38.0 until #432 noticed.
+  const packageLock = readJson(packageLockPath);
+  packageLock.version = nextVersion;
+  if (packageLock.packages?.['']) {
+    packageLock.packages[''].version = nextVersion;
+  }
   tauriConf.version = nextVersion;
   const nextCargoToml = updateCargoPackageVersion(cargoToml, nextVersion);
   const nextCargoLock = updateCargoLockVersion(cargoLock, nextVersion);
@@ -157,6 +166,7 @@ function main() {
   }
 
   writeJson(packagePath, pkg);
+  writeJson(packageLockPath, packageLock);
   writeJson(tauriConfPath, tauriConf);
   fs.writeFileSync(cargoTomlPath, nextCargoToml);
   fs.writeFileSync(cargoLockPath, nextCargoLock);
@@ -173,6 +183,7 @@ function main() {
   console.log('- CHANGELOG.md');
   console.log('- CHANGELOG-zh.md');
   console.log('- package.json');
+  console.log('- package-lock.json');
   console.log('- src-tauri/tauri.conf.json');
   console.log('- src-tauri/Cargo.toml');
   console.log('- src-tauri/Cargo.lock');

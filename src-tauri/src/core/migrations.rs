@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Bump this when adding a new migration.
-const LATEST_VERSION: u32 = 7;
+const LATEST_VERSION: u32 = 8;
 
 /// Run all pending migrations on the database.
 ///
@@ -54,6 +54,7 @@ fn migrate_step(conn: &Connection, from_version: u32) -> Result<()> {
         4 => migrate_v4_to_v5(conn),
         5 => migrate_v5_to_v6(conn),
         6 => migrate_v6_to_v7(conn),
+        7 => migrate_v7_to_v8(conn),
         _ => bail!("unknown migration version: {from_version}"),
     }
 }
@@ -294,6 +295,32 @@ fn migrate_v6_to_v7(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Drop the orphaned `project_default_export_agents` preference.
+///
+/// It was written behind a "save default agents" action that 688fc9b removed
+/// along with the old Add Skills flow, leaving the reader behind. Users who
+/// used that button still carry a frozen subset they can neither see nor
+/// change, and it silently narrows which agents a project preset reaches —
+/// exactly the failure #400 reported, but invisible and unfixable from the UI.
+/// A preference with no way to inspect or edit it is a trap, not a preference.
+fn migrate_v7_to_v8(conn: &Connection) -> Result<()> {
+    // A database can reach this step without a settings table (older partial
+    // schemas do), and a cleanup has no business failing an upgrade.
+    let has_settings: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settings')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_settings {
+        return Ok(());
+    }
+    conn.execute(
+        "DELETE FROM settings WHERE key = 'project_default_export_agents'",
+        [],
+    )?;
+    Ok(())
+}
+
 // ── Helpers ──
 
 fn add_column_if_missing(
@@ -499,6 +526,46 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, LATEST_VERSION);
+    }
+
+    #[test]
+    fn orphaned_default_export_agents_setting_is_dropped() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Arrive at v7 the way a real upgrading database does, then plant the
+        // row that the removed UI used to write.
+        conn.pragma_update(None, "user_version", 0).unwrap();
+        run_migrations(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 7).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('project_default_export_agents', ?1)",
+            ["[\"claude_code\",\"codex\"]"],
+        )
+        .unwrap();
+        assert_eq!(count_setting(&conn), 1, "precondition: the row must exist, or this test proves nothing");
+
+        run_migrations(&conn).unwrap();
+
+        assert_eq!(count_setting(&conn), 0, "v7→v8 must delete the orphaned preference");
+        // Unrelated settings must survive.
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('theme', 'dark')",
+            [],
+        )
+        .unwrap();
+        run_migrations(&conn).unwrap();
+        let theme: String = conn
+            .query_row("SELECT value FROM settings WHERE key = 'theme'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(theme, "dark");
+    }
+
+    fn count_setting(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM settings WHERE key = 'project_default_export_agents'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
     }
 
     #[test]

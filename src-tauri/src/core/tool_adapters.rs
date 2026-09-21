@@ -828,6 +828,48 @@ pub fn default_tool_adapters() -> Vec<ToolAdapter> {
             recursive_scan: false,
             project_relative_skills_dir: None,
         },
+        ToolAdapter {
+            // The GitLab Duo CLI (launched as `glab duo cli`) resolves its
+            // config home to `%APPDATA%\GitLab\duo` on Windows,
+            // `$GLAB_CONFIG_DIR` or `$XDG_CONFIG_HOME/gitlab/duo` when either
+            // is set (GLAB_CONFIG_DIR wins), and `~/.gitlab/duo` otherwise --
+            // then scans `skills` beneath it.
+            //
+            // Adapters resolve paths from the home directory and read no env
+            // vars, so `~/.gitlab/duo/skills` is right on Linux and macOS at
+            // their defaults and nowhere else. THREE cases need a manual path
+            // override, Windows included: there the real location is
+            // `%APPDATA%\GitLab\duo`, not `%USERPROFILE%\.gitlab\duo`, so
+            // `is_installed()` finds nothing and Duo shows as not installed.
+            // Covering that properly needs per-platform adapter paths, which
+            // no adapter has today -- tracked separately, do not bolt a
+            // GitLab-shaped special case into `candidate_paths`.
+            //
+            // Duo also reads the shared `~/.agents/skills` root -- the location
+            // `glab skills install --global` writes to. Discovery only, like
+            // Codex and Copilot, so a deployment lands in Duo's own directory
+            // and cannot be mistaken for another agent's. This one *is* right
+            // on all three platforms: the shared root is `%USERPROFILE%\.agents\skills`
+            // on Windows, which is what resolving from the home dir already gives.
+            //
+            // Its project-level roots are `<repo>/.agents/skills` and
+            // `<repo>/skills`. The bare `skills` variant would claim any
+            // unrelated directory of that name in a workspace, so the project
+            // target is the spec-compliant `.agents/skills`.
+            //
+            // Paths verified by reading the `AgentSkillsResolver` in the
+            // bundled Duo CLI binary, not the documentation.
+            key: "gitlab_duo".into(),
+            display_name: "GitLab Duo".into(),
+            relative_skills_dir: ".gitlab/duo/skills".into(),
+            relative_detect_dir: ".gitlab/duo".into(),
+            additional_scan_dirs: vec![".agents/skills".into()],
+            override_skills_dir: None,
+            category: ToolCategory::Coding,
+            is_custom: false,
+            recursive_scan: false,
+            project_relative_skills_dir: Some(".agents/skills".into()),
+        },
     ]
 }
 
@@ -1091,6 +1133,33 @@ mod tests {
             .contains(&".agents/skills".to_string()));
         assert!(!adapter.is_custom);
         assert_eq!(adapter.category, ToolCategory::Coding);
+    }
+
+    /// Paths verified against the `AgentSkillsResolver` in the bundled Duo CLI
+    /// binary rather than the GitLab docs: the config home is
+    /// `$XDG_CONFIG_HOME/gitlab/duo` or `~/.gitlab/duo`, global skills sit in
+    /// `skills` beneath it, and `~/.agents/skills` is a second global root.
+    #[test]
+    fn gitlab_duo_deploys_to_its_config_home_and_discovers_the_shared_root() {
+        let adapter = default_tool_adapters()
+            .into_iter()
+            .find(|adapter| adapter.key == "gitlab_duo")
+            .expect("gitlab_duo adapter should exist");
+
+        assert_eq!(adapter.display_name, "GitLab Duo");
+        assert_eq!(adapter.relative_skills_dir, ".gitlab/duo/skills");
+        assert_eq!(adapter.relative_detect_dir, ".gitlab/duo");
+        // Duo's other project root is a bare `<repo>/skills`, which would claim
+        // any unrelated directory of that name, so the project target is the
+        // spec-compliant one and differs from the global path.
+        assert_eq!(adapter.project_relative_skills_dir(), ".agents/skills");
+        // Shared root: discovery only, never a deploy target.
+        assert!(adapter
+            .additional_scan_dirs
+            .contains(&".agents/skills".to_string()));
+        assert_eq!(adapter.category, ToolCategory::Coding);
+        assert!(!adapter.is_custom);
+        assert!(!adapter.recursive_scan);
     }
 
     #[test]
