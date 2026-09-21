@@ -12,6 +12,11 @@ static BASE_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 /// Test-only redirection of the home directory, so a test can exercise paths
 /// that are deliberately *not* relocatable by the user (see `cli_bridge`).
 static HOME_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+/// Test-only redirection of the config file. The save-then-restart round trip
+/// has to write a real config file to be meaningful, and that must never be the
+/// developer's own (~/.config/skills-manager/repo-config.json).
+#[cfg(test)]
+static CONFIG_PATH_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static SKILLS_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static STARTUP_WARNINGS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 static STARTUP_ERROR_LOG: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
@@ -113,10 +118,27 @@ pub(crate) fn set_test_home_dir_override(path: Option<PathBuf>) {
 }
 
 fn config_file_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = CONFIG_PATH_OVERRIDE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        return path;
+    }
     dirs::config_dir()
         .unwrap_or_else(default_base_dir)
         .join("skills-manager")
         .join(CONFIG_FILE_NAME)
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_config_path_override(path: Option<PathBuf>) {
+    *CONFIG_PATH_OVERRIDE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = path;
 }
 
 /// Distinguishes "no config file" (normal fresh install) from "config file
@@ -203,6 +225,19 @@ pub fn configured_base_dir() -> Option<PathBuf> {
         .and_then(|path| normalize_path(&path).ok())
 }
 
+/// Where the library's data actually lives right now.
+///
+/// This is the **Live Location** (see ADR 0001), not the location the user asked
+/// for. The two differ while a migration is pending: `repo_path` already names
+/// the requested destination, but the data has not moved yet, so it is still at
+/// the source. Resolving that here — rather than at the call site — keeps every
+/// path derived from `base_dir()` (skills, cache, logs, the database, and the
+/// write lock) on the directory that actually holds the library.
+///
+/// Getting this wrong is the bug behind #449/#469: following `repo_path`
+/// immediately made the running session split across two locations, and the
+/// first `RepoLock` created the destination and wrote its lock file into it, so
+/// the next launch's migration saw a non-empty target and refused it forever.
 pub fn base_dir() -> PathBuf {
     if let Some(path) = BASE_DIR_OVERRIDE
         .get_or_init(|| Mutex::new(None))
@@ -213,7 +248,29 @@ pub fn base_dir() -> PathBuf {
         return path;
     }
 
-    configured_base_dir().unwrap_or_else(default_base_dir)
+    live_base_dir(&load_config())
+}
+
+/// The location a session should run against, given the stored config.
+fn live_base_dir(config: &RepoPathConfig) -> PathBuf {
+    if let Some(source) = &config.pending_migration_from {
+        if let Ok(path) = normalize_path(source) {
+            if path.is_dir() {
+                return path;
+            }
+        }
+    }
+    requested_base_dir(config)
+}
+
+/// The location the user asked for, whether or not the data has moved there yet
+/// (the **Requested Path**).
+fn requested_base_dir(config: &RepoPathConfig) -> PathBuf {
+    config
+        .repo_path
+        .as_deref()
+        .and_then(|raw| normalize_path(raw).ok())
+        .unwrap_or_else(default_base_dir)
 }
 
 /// Whether an explicit runtime base-dir override is active (CLI `--skills-root`
@@ -359,7 +416,31 @@ pub fn db_path() -> PathBuf {
     base_dir().join("skills-manager.db")
 }
 
-pub fn set_base_dir_override(path: Option<String>) -> Result<PathBuf> {
+/// Whether the user wants the library moved, or wants to use one that is
+/// already at the destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RepoPathIntent {
+    /// Copy the current library to the requested path, then switch to it.
+    Migrate,
+    /// The destination already holds a library; use it as-is, copying nothing.
+    Adopt,
+}
+
+/// Record where the user wants the library, without moving it there.
+///
+/// Saving is a promise, not an action (ADR 0001): the data stays where it is and
+/// the switch happens on the next launch. Crucially the runtime override is pinned
+/// to the current Live Location, because [`base_dir`] otherwise resolves through
+/// the config this function just rewrote — which is exactly how the running
+/// session came to write into the destination and poison the next migration.
+///
+/// Returns the **requested** path (what the caller should report back), not the
+/// location in use.
+pub fn set_base_dir_override(
+    path: Option<String>,
+    intent: RepoPathIntent,
+) -> Result<PathBuf> {
     let current = base_dir();
     let mut config = load_config();
 
@@ -386,26 +467,185 @@ pub fn set_base_dir_override(path: Option<String>) -> Result<PathBuf> {
     } else {
         None
     };
-    config.pending_migration_from = if next != data_location {
+    config.pending_migration_from = if intent == RepoPathIntent::Adopt {
+        // The library is already at the destination — nothing to move. Clearing
+        // the marker is what makes the next launch land on it directly.
+        None
+    } else if next != data_location {
         Some(data_location.to_string_lossy().to_string())
     } else {
         None
     };
     save_config(&config)?;
+
+    // Keep this session on the data it already has open.
+    //
+    // For a Migrate the pending marker alone does that: `base_dir()` resolves
+    // the marker back to the source, so no override is needed — which matters,
+    // because an active override also disables migration in `ensure_central_repo`
+    // and the CLI's `repo set-path` relies on the *next* process migrating
+    // immediately. For an Adopt the marker is gone, so `base_dir()` would jump to
+    // the destination while the database handle and every open path still refer
+    // to the old location — the split-session half of #449/#469. Pin only when
+    // the resolution would otherwise move out from under the session.
+    if live_base_dir(&config) != data_location {
+        set_runtime_base_dir_override(Some(data_location));
+    }
+
     Ok(next)
 }
 
-fn directory_has_entries(path: &Path) -> Result<bool> {
+/// Abandon a pending switch: keep using the library the session is on, and stop
+/// intending to move anywhere. Distinct from [`set_base_dir_override`] with
+/// `None`, which *does* intend a move (back to the default location).
+///
+/// "Stay here" is expressed as a preference for the current Live Location. The
+/// pending marker alone is not enough to recover it: after an adoption there is
+/// none (nothing is migrated), so clearing the marker and leaving `repo_path`
+/// pointing at the destination would silently discard the running library.
+/// Written as a preference for the Live Location rather than an absolute path so
+/// that staying on the default location keeps tracking the default (no stored
+/// path, so it still follows a future change of `$HOME`).
+pub fn cancel_pending_migration() -> Result<()> {
+    let mut config = load_config();
+    let data_location = base_dir();
+    config.pending_migration_from = None;
+    config.repo_path = if paths_are_same_dir(&data_location, &default_base_dir()) {
+        None
+    } else {
+        Some(data_location.to_string_lossy().to_string())
+    };
+    save_config(&config)
+}
+
+/// Where the library is headed on the next launch, if that differs from where it
+/// is now — whether the user asked for a move or to adopt a library already
+/// there. Comparing the two facts beats tracking which intent produced them:
+/// the UI only ever needs "are these the same place?", and a pending marker
+/// cannot express a pending adoption (nothing is migrated).
+pub fn pending_switch_target() -> Option<PathBuf> {
+    let config = load_config();
+    let live = base_dir();
+    let requested = requested_base_dir(&config);
+    (requested != live).then_some(requested)
+}
+
+/// What a candidate destination turns out to hold.
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum TargetInspection {
+    /// Safe to migrate into (absent, or App-owned Debris only).
+    Empty { requested_path: String },
+    /// An existing Skills Manager library.
+    ExistingLibrary {
+        requested_path: String,
+        skill_count: usize,
+    },
+    /// Someone else's data. Neither migratable nor adoptable here.
+    NotEmpty { requested_path: String },
+}
+
+/// Classify a destination the user picked, without touching it.
+///
+/// Adoption of foreign skill directories is deliberately out of scope (ADR
+/// 0001): we only recognise our own library, so anything else is refused with
+/// the user still at the wheel.
+///
+/// The normalised path is returned so the caller can save exactly what was
+/// inspected (expanding `~`, collapsing `..`), rather than re-normalising later
+/// and risking a different result.
+pub fn inspect_target(raw: &str) -> Result<TargetInspection> {
+    let path = normalize_path(raw)?;
+    let requested_path = path.to_string_lossy().to_string();
+    if !target_has_user_data(&path)? {
+        return Ok(TargetInspection::Empty { requested_path });
+    }
+    if path.join("skills-manager.db").is_file() {
+        return Ok(TargetInspection::ExistingLibrary {
+            requested_path,
+            skill_count: count_library_skills(&path),
+        });
+    }
+    Ok(TargetInspection::NotEmpty { requested_path })
+}
+
+/// Best-effort skill count for the confirmation prompt. A count of 0 is a
+/// fine fallback: the prompt's purpose is "this is a library", not the exact
+/// number, and we must not fail the inspection over an unreadable database.
+fn count_library_skills(base: &Path) -> usize {
+    let db = base.join("skills-manager.db");
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        &db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return 0;
+    };
+    conn.query_row("SELECT COUNT(*) FROM skills", [], |row| row.get::<_, i64>(0))
+        .unwrap_or(0)
+        .max(0) as usize
+}
+
+/// Names this app creates in a would-be library location before any migration
+/// runs: the write lock, and the skeleton dirs [`ensure_central_repo`] makes.
+/// These are App-owned Debris (ADR 0001) — never user data.
+const APP_OWNED_ENTRIES: [&str; 5] = [
+    crate::core::repo_lock::LOCK_FILE_NAME,
+    "skills",
+    "scenarios",
+    "cache",
+    "logs",
+];
+
+/// Whether `path` holds anything the user would miss if it were overwritten.
+///
+/// A location containing only App-owned Debris is still an Empty Target, so it
+/// stays migratable. The whitelist is fixed and each entry must itself be empty
+/// to qualify — deliberately *not* a heuristic, because mistaking real data for
+/// debris would destroy it, which is the failure #252 exists to prevent.
+fn target_has_user_data(path: &Path) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
     }
-    Ok(fs::read_dir(path)?.next().is_some())
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            // An undecodable name is something we did not write.
+            return Ok(true);
+        };
+        if !APP_OWNED_ENTRIES.contains(&name) {
+            return Ok(true);
+        }
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            // A skeleton dir is debris only while it is still empty. Anything
+            // inside it is the user's (or a real library's) and blocks the move.
+            if fs::read_dir(&entry_path)?.next().is_some() {
+                return Ok(true);
+            }
+        } else if entry_path.is_file() {
+            // The lock file carries a pid/operation stamp, so it is non-empty by
+            // nature; its mere existence is what qualifies it as debris.
+            continue;
+        } else {
+            // Symlink or other special file we did not create.
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
     for entry in WalkDir::new(source) {
         let entry = entry?;
         let relative = entry.path().strip_prefix(source)?;
+        // Never carry the live lock into the destination: it names *this*
+        // process's in-flight operation and is meaningless in the new location,
+        // where a fresh one is created on demand. Leaving it behind would also
+        // re-introduce the very debris that blocked migration (#449/#469).
+        if relative == Path::new(crate::core::repo_lock::LOCK_FILE_NAME) {
+            continue;
+        }
         let destination = target.join(relative);
         if entry.file_type().is_dir() {
             fs::create_dir_all(&destination)?;
@@ -440,6 +680,7 @@ fn paths_are_same_dir(a: &Path, b: &Path) -> bool {
 }
 
 /// What the caller should do after attempting a pending central-repo move.
+#[derive(Debug)]
 enum MigrationOutcome {
     /// No move was pending, or it completed. Run against the configured base.
     Proceed,
@@ -457,7 +698,7 @@ enum MigrationOutcome {
 /// the user's data is known to be intact. It mutates `config` in place but
 /// does NOT persist it — the caller saves once, which also keeps this unit
 /// testable without touching the real config file.
-fn migrate_repo_if_needed(config: &mut RepoPathConfig, current_base: &Path) -> MigrationOutcome {
+fn migrate_repo_if_needed(config: &mut RepoPathConfig, target: &Path) -> MigrationOutcome {
     let Some(source_raw) = config.pending_migration_from.clone() else {
         return MigrationOutcome::Proceed;
     };
@@ -480,16 +721,16 @@ fn migrate_repo_if_needed(config: &mut RepoPathConfig, current_base: &Path) -> M
     // `D:\Skills` and `d:\skills` are one directory (likewise 8.3 vs long, or a
     // symlink), and a lexical mismatch would otherwise loop forever on
     // `migration_incomplete`, telling the user to empty their own library.
-    if !source.exists() || paths_are_same_dir(&source, current_base) {
+    if !source.exists() || paths_are_same_dir(&source, target) {
         config.pending_migration_from = None;
         return MigrationOutcome::Proceed;
     }
 
     // A target nested inside the source can never be a valid destination.
-    if current_base.starts_with(&source) {
+    if target.starts_with(&source) {
         record_startup_error(format!(
             "central repo: migration target {} is inside source {}; keeping data at the source",
-            current_base.display(),
+            target.display(),
             source.display()
         ));
         push_startup_warning("migration_incomplete");
@@ -502,29 +743,34 @@ fn migrate_repo_if_needed(config: &mut RepoPathConfig, current_base: &Path) -> M
     // intact source is lossless, overwriting is not. A fresh target also means
     // the recursive copy only ever creates new files, so it can never hit the
     // read-only git pack files that overwriting bricked startup on (#252).
-    let target_empty = match directory_has_entries(current_base) {
-        Ok(has_entries) => !has_entries,
+    //
+    // "Empty" ignores App-owned Debris (ADR 0001): the lock file and the bare
+    // skeleton dirs this app creates on its own. Without that exclusion a single
+    // stray lock file — written by any `RepoLock` between the user saving a new
+    // path and the next launch — made the move fail forever (#449/#469).
+    let target_has_data = match target_has_user_data(target) {
+        Ok(has_data) => has_data,
         Err(err) => {
             record_startup_error(format!(
                 "central repo: cannot inspect migration target {} ({err}); keeping data at source {}",
-                current_base.display(),
+                target.display(),
                 source.display()
             ));
             push_startup_warning("migration_incomplete");
             return MigrationOutcome::UseSource(source);
         }
     };
-    if !target_empty {
+    if target_has_data {
         record_startup_error(format!(
             "central repo: migration target {} is not empty; keeping data at source {}",
-            current_base.display(),
+            target.display(),
             source.display()
         ));
         push_startup_warning("migration_incomplete");
         return MigrationOutcome::UseSource(source);
     }
 
-    if let Some(parent) = current_base.parent() {
+    if let Some(parent) = target.parent() {
         if let Err(err) = fs::create_dir_all(parent) {
             record_startup_error(format!(
                 "central repo: cannot create migration target parent {} ({err}); keeping data at source {}",
@@ -539,12 +785,12 @@ fn migrate_repo_if_needed(config: &mut RepoPathConfig, current_base: &Path) -> M
     // Same volume: an atomic rename moves the whole tree cheaply. Cross volume
     // (or a rename the OS refuses): copy into the empty target. Because the
     // target is empty, no existing file is ever overwritten.
-    if fs::rename(&source, current_base).is_err() {
-        if let Err(err) = copy_dir_recursive(&source, current_base) {
+    if fs::rename(&source, target).is_err() {
+        if let Err(err) = copy_dir_recursive(&source, target) {
             record_startup_error(format!(
                 "central repo: migration copy from {} to {} failed ({err:#}); keeping data at source",
                 source.display(),
-                current_base.display()
+                target.display()
             ));
             push_startup_warning("migration_incomplete");
             return MigrationOutcome::UseSource(source);
@@ -591,8 +837,11 @@ pub fn ensure_central_repo() -> Result<()> {
     // sets an override before this point, so the #252 path is unaffected.
     if !base_dir_override_active() {
         let pending_before = config.pending_migration_from.clone();
-        let current_base = base_dir();
-        let outcome = migrate_repo_if_needed(&mut config, &current_base);
+        // The migration's target is the *requested* path, not `base_dir()`: the
+        // latter now resolves to the source while a migration is pending (ADR
+        // 0001), so using it here would ask the move to overwrite its own source.
+        let target = requested_base_dir(&config);
+        let outcome = migrate_repo_if_needed(&mut config, &target);
         if config.pending_migration_from != pending_before {
             if let Err(err) = save_config(&config) {
                 record_startup_error(format!(
@@ -601,9 +850,10 @@ pub fn ensure_central_repo() -> Result<()> {
             }
         }
         if let MigrationOutcome::UseSource(source) = outcome {
-            // Run this whole session against the intact source library.
-            // `base_dir()` (and every dir derived from it) now resolves there,
-            // so the code below and the rest of startup stay consistent.
+            // Run this whole session against the intact source library. The
+            // `base_dir()` resolution above already does this while the pending
+            // marker survives, but pin it explicitly too: if the marker is
+            // cleared later this session must not drift onto the target.
             set_runtime_base_dir_override(Some(source));
         }
     }
@@ -688,6 +938,424 @@ mod tests {
         assert!(config.pending_migration_from.is_some(), "marker kept for retry");
         assert_eq!(fs::read(dst.path().join("existing.txt")).unwrap(), b"dst-data");
         assert_eq!(fs::read(src.path().join("a.txt")).unwrap(), b"src");
+    }
+
+    // ── App-owned Debris is not user data (ADR 0001, #449/#469) ──
+
+    /// The bug: any `RepoLock` between the user saving a new path and the next
+    /// launch wrote the lock file into the destination, so the migration saw a
+    /// non-empty target and refused it — every launch, forever.
+    #[test]
+    fn migration_into_target_holding_only_the_lock_file_moves() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::create_dir_all(src.path().join("skills")).unwrap();
+        fs::write(src.path().join("skills/s.md"), b"skill").unwrap();
+        fs::write(
+            dst.path().join(crate::core::repo_lock::LOCK_FILE_NAME),
+            b"pid=4321\noperation=auto backup\n",
+        )
+        .unwrap();
+
+        let mut config = config_migrating(src.path(), dst.path());
+        let outcome = migrate_repo_if_needed(&mut config, dst.path());
+
+        assert!(matches!(outcome, MigrationOutcome::Proceed), "got {outcome:?}");
+        assert_eq!(config.pending_migration_from, None, "migration completed");
+        assert!(dst.path().join("skills/s.md").exists());
+    }
+
+    /// The other half of the same bug: `ensure_central_repo` pre-creates the
+    /// skeleton dirs, so a target that only ever held those must still move.
+    #[test]
+    fn migration_into_target_holding_only_empty_skeletons_moves() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::create_dir_all(src.path().join("skills")).unwrap();
+        fs::write(src.path().join("skills/s.md"), b"skill").unwrap();
+        for dir in ["skills", "scenarios", "cache", "logs"] {
+            fs::create_dir_all(dst.path().join(dir)).unwrap();
+        }
+
+        let mut config = config_migrating(src.path(), dst.path());
+        let outcome = migrate_repo_if_needed(&mut config, dst.path());
+
+        assert!(matches!(outcome, MigrationOutcome::Proceed), "got {outcome:?}");
+        assert!(dst.path().join("skills/s.md").exists());
+    }
+
+    /// A skeleton dir that has anything in it is user data, not debris. This is
+    /// the guard that keeps the debris whitelist from becoming a way to
+    /// overwrite a real library (the #252 failure mode).
+    #[test]
+    fn migration_into_target_with_data_inside_a_skeleton_dir_is_refused() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("a.txt"), b"src").unwrap();
+        fs::create_dir_all(dst.path().join("skills")).unwrap();
+        fs::write(dst.path().join("skills/precious.md"), b"user-data").unwrap();
+
+        let mut config = config_migrating(src.path(), dst.path());
+        let outcome = migrate_repo_if_needed(&mut config, dst.path());
+
+        assert!(matches!(outcome, MigrationOutcome::UseSource(_)), "got {outcome:?}");
+        assert_eq!(
+            fs::read(dst.path().join("skills/precious.md")).unwrap(),
+            b"user-data",
+            "the refused target must be left untouched"
+        );
+    }
+
+    #[test]
+    fn target_has_user_data_ignores_only_app_owned_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!target_has_user_data(dir.path()).unwrap(), "empty dir");
+
+        fs::write(dir.path().join(crate::core::repo_lock::LOCK_FILE_NAME), b"x").unwrap();
+        assert!(
+            !target_has_user_data(dir.path()).unwrap(),
+            "the lock file alone is debris"
+        );
+
+        fs::write(dir.path().join("skills-manager.db"), b"db").unwrap();
+        assert!(
+            target_has_user_data(dir.path()).unwrap(),
+            "anything outside the whitelist counts as data"
+        );
+    }
+
+    // ── Live Location vs Requested Path (ADR 0001) ──
+
+    /// While a migration is pending, the session must keep running against the
+    /// data. Following `repo_path` immediately is what split a session across
+    /// two locations and let the lock file poison the destination.
+    #[test]
+    fn pending_migration_keeps_the_session_on_the_source() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let config = config_migrating(src.path(), dst.path());
+
+        assert_eq!(live_base_dir(&config), src.path());
+        assert_eq!(requested_base_dir(&config), dst.path());
+    }
+
+    #[test]
+    fn without_a_pending_migration_the_requested_path_is_live() {
+        let dst = tempfile::tempdir().unwrap();
+        let config = RepoPathConfig {
+            repo_path: Some(dst.path().to_string_lossy().to_string()),
+            pending_migration_from: None,
+        };
+
+        assert_eq!(live_base_dir(&config), dst.path());
+    }
+
+    /// A source that no longer exists cannot be where the data is; falling back
+    /// to the requested path avoids pinning a session to a deleted directory.
+    #[test]
+    fn pending_migration_with_a_vanished_source_falls_back_to_the_target() {
+        let dst = tempfile::tempdir().unwrap();
+        let gone = dst.path().join("removed");
+        let config = config_migrating(&gone, dst.path());
+
+        assert_eq!(live_base_dir(&config), dst.path());
+    }
+
+    #[test]
+    fn inspect_target_classifies_empty_library_and_foreign_data() {
+        // Absent and debris-only destinations are migratable.
+        let fresh = tempfile::tempdir().unwrap();
+        let missing = fresh.path().join("missing");
+        assert_eq!(
+            inspect_target(&missing.to_string_lossy()).unwrap(),
+            TargetInspection::Empty {
+                requested_path: missing.to_string_lossy().to_string(),
+            }
+        );
+        let debris = tempfile::tempdir().unwrap();
+        fs::write(
+            debris.path().join(crate::core::repo_lock::LOCK_FILE_NAME),
+            b"x",
+        )
+        .unwrap();
+        fs::create_dir_all(debris.path().join("skills")).unwrap();
+        assert_eq!(
+            inspect_target(&debris.path().to_string_lossy()).unwrap(),
+            TargetInspection::Empty {
+                requested_path: debris.path().to_string_lossy().to_string(),
+            }
+        );
+
+        // A real library is recognised as such.
+        let library = tempfile::tempdir().unwrap();
+        let db = library.path().join("skills-manager.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE skills (id TEXT PRIMARY KEY, name TEXT NOT NULL, \
+             description TEXT, source_type TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO skills (id, name, source_type) VALUES ('1', 'a', 'local'), ('2', 'b', 'local')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(
+            inspect_target(&library.path().to_string_lossy()).unwrap(),
+            TargetInspection::ExistingLibrary {
+                requested_path: library.path().to_string_lossy().to_string(),
+                skill_count: 2,
+            }
+        );
+
+        // Someone else's data is neither migratable nor adoptable here.
+        let foreign = tempfile::tempdir().unwrap();
+        fs::write(foreign.path().join("notes.txt"), b"mine").unwrap();
+        assert_eq!(
+            inspect_target(&foreign.path().to_string_lossy()).unwrap(),
+            TargetInspection::NotEmpty {
+                requested_path: foreign.path().to_string_lossy().to_string(),
+            }
+        );
+    }
+
+    /// The lock names *this* process's in-flight operation, so it must not be
+    /// carried into the destination — that would re-create the poisoned target.
+    #[test]
+    fn copy_dir_recursive_leaves_the_lock_file_behind() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("keep.md"), b"keep").unwrap();
+        fs::write(
+            src.path().join(crate::core::repo_lock::LOCK_FILE_NAME),
+            b"pid=1\n",
+        )
+        .unwrap();
+
+        let target = dst.path().join("out");
+        copy_dir_recursive(src.path(), &target).unwrap();
+
+        assert!(target.join("keep.md").exists());
+        assert!(
+            !target.join(crate::core::repo_lock::LOCK_FILE_NAME).exists(),
+            "the lock file must not be copied"
+        );
+    }
+
+    // ── save-then-restart round trip (the #449/#469 report) ──
+
+    /// A save must not move the session onto the destination. Before the fix,
+    /// `base_dir()` followed `repo_path` the instant it was written, so any
+    /// `RepoLock` in the same session created the destination and wrote its lock
+    /// file there — poisoning the migration that was supposed to run next launch.
+    #[test]
+    fn saving_a_new_path_keeps_the_session_on_the_current_library() {
+        let _guard = test_base_dir_lock();
+        let home = tempfile::tempdir().unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        set_test_home_dir_override(Some(home.path().to_path_buf()));
+        set_test_config_path_override(Some(cfg_dir.path().join(CONFIG_FILE_NAME)));
+        set_runtime_base_dir_override(None);
+
+        // Start on a populated default library.
+        let live = home.path().join(".skills-manager");
+        fs::create_dir_all(live.join("skills")).unwrap();
+        fs::write(live.join("skills/keep.md"), b"skill").unwrap();
+        assert_eq!(base_dir(), live);
+
+        let target = home.path().join("moved");
+        set_base_dir_override(
+            Some(target.to_string_lossy().to_string()),
+            RepoPathIntent::Migrate,
+        )
+        .unwrap();
+
+        // The session must still be on the data, and the destination untouched.
+        assert_eq!(base_dir(), live, "session moved before the migration");
+        assert!(
+            !target.exists(),
+            "the destination must not be created before the migration"
+        );
+
+        // Now the restart: the migration runs and completes.
+        set_runtime_base_dir_override(None);
+        ensure_central_repo().unwrap();
+        assert_eq!(base_dir(), target, "migration did not complete on restart");
+        assert!(target.join("skills/keep.md").exists());
+
+        set_test_config_path_override(None);
+        set_test_home_dir_override(None);
+        set_runtime_base_dir_override(None);
+    }
+
+    /// The end-to-end shape of the bug report: the destination picks up a lock
+    /// file from a stray operation, and the migration must still succeed next
+    /// launch instead of retrying forever.
+    #[test]
+    fn migration_succeeds_when_the_target_only_holds_app_debris() {
+        let _guard = test_base_dir_lock();
+        let home = tempfile::tempdir().unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        set_test_home_dir_override(Some(home.path().to_path_buf()));
+        set_test_config_path_override(Some(cfg_dir.path().join(CONFIG_FILE_NAME)));
+        set_runtime_base_dir_override(None);
+
+        let live = home.path().join(".skills-manager");
+        fs::create_dir_all(live.join("skills")).unwrap();
+        fs::write(live.join("skills/keep.md"), b"skill").unwrap();
+
+        let target = home.path().join("moved");
+        set_base_dir_override(
+            Some(target.to_string_lossy().to_string()),
+            RepoPathIntent::Migrate,
+        )
+        .unwrap();
+
+        // Whatever created this (an older build, a stray CLI run) left debris.
+        fs::create_dir_all(target.join("skills")).unwrap();
+        fs::write(
+            target.join(crate::core::repo_lock::LOCK_FILE_NAME),
+            b"pid=9\n",
+        )
+        .unwrap();
+
+        set_runtime_base_dir_override(None);
+        ensure_central_repo().unwrap();
+
+        assert_eq!(base_dir(), target, "debris-only target blocked the migration");
+        assert!(target.join("skills/keep.md").exists());
+        assert!(!target.join("skills").is_empty());
+
+        set_test_config_path_override(None);
+        set_test_home_dir_override(None);
+        set_runtime_base_dir_override(None);
+    }
+
+    /// A save that is never acted on must be abandonable, leaving the library
+    /// exactly where it is.
+    #[test]
+    fn cancelling_a_pending_migration_keeps_the_library_in_place() {
+        let _guard = test_base_dir_lock();
+        let home = tempfile::tempdir().unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        set_test_home_dir_override(Some(home.path().to_path_buf()));
+        set_test_config_path_override(Some(cfg_dir.path().join(CONFIG_FILE_NAME)));
+        set_runtime_base_dir_override(None);
+
+        let live = home.path().join(".skills-manager");
+        fs::create_dir_all(live.join("skills")).unwrap();
+        fs::write(live.join("skills/keep.md"), b"skill").unwrap();
+
+        let target = home.path().join("moved");
+        set_base_dir_override(
+            Some(target.to_string_lossy().to_string()),
+            RepoPathIntent::Migrate,
+        )
+        .unwrap();
+        assert_eq!(pending_switch_target(), Some(target.clone()));
+
+        cancel_pending_migration().unwrap();
+        set_runtime_base_dir_override(None);
+        ensure_central_repo().unwrap();
+
+        assert_eq!(base_dir(), live, "cancel must keep the library where it is");
+        assert!(pending_switch_target().is_none());
+        assert!(!target.exists());
+
+        set_test_config_path_override(None);
+        set_test_home_dir_override(None);
+        set_runtime_base_dir_override(None);
+    }
+
+    /// Cancelling must work even when nothing is pending — the shape left by an
+    /// adoption. Clearing the marker and leaving `repo_path` on the destination
+    /// would drop the running library and fall back to an empty default (#228).
+    #[test]
+    fn cancelling_after_an_adoption_keeps_the_adopted_library() {
+        let _guard = test_base_dir_lock();
+        let home = tempfile::tempdir().unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        set_test_home_dir_override(Some(home.path().to_path_buf()));
+        set_test_config_path_override(Some(cfg_dir.path().join(CONFIG_FILE_NAME)));
+        set_runtime_base_dir_override(None);
+
+        let live = home.path().join(".skills-manager");
+        fs::create_dir_all(live.join("skills")).unwrap();
+        fs::write(live.join("skills/keep.md"), b"skill").unwrap();
+
+        let other = home.path().join("other-library");
+        fs::create_dir_all(other.join("skills")).unwrap();
+
+        // Adopt, then restart into it, so the session runs on `other` with no
+        // pending marker at all.
+        set_base_dir_override(
+            Some(other.to_string_lossy().to_string()),
+            RepoPathIntent::Adopt,
+        )
+        .unwrap();
+        set_runtime_base_dir_override(None);
+        ensure_central_repo().unwrap();
+        assert_eq!(base_dir(), other);
+
+        cancel_pending_migration().unwrap();
+        set_runtime_base_dir_override(None);
+        ensure_central_repo().unwrap();
+
+        assert_eq!(
+            base_dir(),
+            other,
+            "cancelling must not strand the session on an empty default"
+        );
+        assert!(other.join("skills").exists());
+
+        set_test_config_path_override(None);
+        set_test_home_dir_override(None);
+        set_runtime_base_dir_override(None);
+    }
+
+    /// Adopting a library that is already at the destination switches there on
+    /// the next launch without copying anything.
+    #[test]
+    fn adopting_an_existing_library_switches_without_copying() {
+        let _guard = test_base_dir_lock();
+        let home = tempfile::tempdir().unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        set_test_home_dir_override(Some(home.path().to_path_buf()));
+        set_test_config_path_override(Some(cfg_dir.path().join(CONFIG_FILE_NAME)));
+        set_runtime_base_dir_override(None);
+
+        let live = home.path().join(".skills-manager");
+        fs::create_dir_all(live.join("skills")).unwrap();
+        fs::write(live.join("skills/keep.md"), b"skill").unwrap();
+
+        let other = home.path().join("other-library");
+        fs::create_dir_all(other.join("skills")).unwrap();
+        fs::write(other.join("skills/other.md"), b"other").unwrap();
+
+        set_base_dir_override(
+            Some(other.to_string_lossy().to_string()),
+            RepoPathIntent::Adopt,
+        )
+        .unwrap();
+
+        // Still running on the old data until the restart...
+        assert_eq!(base_dir(), live);
+
+        set_runtime_base_dir_override(None);
+        ensure_central_repo().unwrap();
+
+        // ...and now on the adopted library, whose contents are untouched.
+        assert_eq!(base_dir(), other);
+        assert!(other.join("skills/other.md").exists());
+        assert!(
+            !other.join("skills/keep.md").exists(),
+            "adoption must not copy the old library in"
+        );
+
+        set_test_config_path_override(None);
+        set_test_home_dir_override(None);
+        set_runtime_base_dir_override(None);
     }
 
     #[test]

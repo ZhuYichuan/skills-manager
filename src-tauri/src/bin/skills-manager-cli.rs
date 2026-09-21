@@ -710,12 +710,12 @@ fn run_repo(args: RepoArgs, store: &SkillStore, json: bool) -> anyhow::Result<()
     match args.command {
         RepoCommand::Status => print_json(&repo_status(store), json),
         RepoCommand::SetPath { path } => {
-            central_repo::set_base_dir_override(Some(path))?;
+            central_repo::set_base_dir_override(Some(path), central_repo::RepoPathIntent::Migrate)?;
             let store = app_state::initialize_cli_store()?;
             print_json(&repo_status(&store), json);
         }
         RepoCommand::ResetPath => {
-            central_repo::set_base_dir_override(None)?;
+            central_repo::set_base_dir_override(None, central_repo::RepoPathIntent::Migrate)?;
             let store = app_state::initialize_cli_store()?;
             print_json(&repo_status(&store), json);
         }

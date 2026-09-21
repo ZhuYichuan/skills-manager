@@ -453,11 +453,36 @@ export const getCentralRepoPath = () =>
 export const getCentralRepoPathOverride = () =>
   invoke<string | null>("get_central_repo_path_override");
 
+/**
+ * Destination of a pending switch — where the library will be after a restart,
+ * when that differs from where it is now. The Live Location and this can
+ * legitimately differ, which is why the UI shows both.
+ */
+export const getCentralRepoPendingTarget = () =>
+  invoke<string | null>("get_central_repo_pending_target");
+
+/** What a chosen destination turned out to hold (see `TargetInspection`). */
+export type CentralRepoPathOutcome =
+  | { kind: "empty"; requestedPath: string }
+  | { kind: "existingLibrary"; requestedPath: string; skillCount: number }
+  | { kind: "notEmpty"; requestedPath: string };
+
+export const inspectCentralRepoTarget = (path: string) =>
+  invoke<CentralRepoPathOutcome>("inspect_central_repo_target", { path });
+
+export const cancelCentralRepoMigration = () =>
+  invoke<void>("cancel_central_repo_migration");
+
 export const getCentralRepoWarnings = () =>
   invoke<string[]>("get_central_repo_warnings");
 
-export const setCentralRepoPath = (path?: string | null) =>
-  invoke<string>("set_central_repo_path", { path: path ?? null });
+/** `intent` defaults to a migration on the Rust side; `adopt` uses a library
+ *  that is already at `path` without copying anything. */
+export const setCentralRepoPath = (
+  path?: string | null,
+  intent?: "migrate" | "adopt"
+) =>
+  invoke<string>("set_central_repo_path", { path: path ?? null, intent: intent ?? null });
 
 export const appExit = () => invoke<void>("app_exit");
 

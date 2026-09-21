@@ -57,6 +57,7 @@ import { cn } from "../utils";
 import { useApp } from "../context/AppContext";
 import { useThemeContext } from "../context/ThemeContext";
 import { AgentIcon } from "../components/AgentIcon";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import { ToggleSwitch } from "../components/ToggleSwitch";
 import * as api from "../lib/tauri";
 import { applyTextSize } from "../lib/textScale";
@@ -173,6 +174,14 @@ export function Settings() {
   const [repoWarnings, setRepoWarnings] = useState<string[]>([]);
   const [centralRepoPath, setCentralRepoPath] = useState("");
   const [centralRepoPathOverride, setCentralRepoPathOverride] = useState<string | null>(null);
+  // Destination of a migration that has not run yet. While this is set the
+  // field above shows where the data *is*, and this shows where it will go.
+  const [centralRepoPendingTarget, setCentralRepoPendingTarget] = useState<string | null>(null);
+  const [centralRepoPathError, setCentralRepoPathError] = useState<string | null>(null);
+  const [existingLibraryPrompt, setExistingLibraryPrompt] = useState<{
+    path: string;
+    skillCount: number;
+  } | null>(null);
   const [editingCentralRepoPath, setEditingCentralRepoPath] = useState(false);
   const [centralRepoPathInput, setCentralRepoPathInput] = useState("");
   const [savingCentralRepoPath, setSavingCentralRepoPath] = useState(false);
@@ -350,6 +359,7 @@ export function Settings() {
       setCentralRepoPathInput(path);
     }).catch(() => {});
     api.getCentralRepoPathOverride().then(setCentralRepoPathOverride).catch(() => {});
+    api.getCentralRepoPendingTarget().then(setCentralRepoPendingTarget).catch(() => {});
 
     // The saved setting is the single source of truth. Do not backfill from
     // `.git/config` — that made a cleared URL reappear on reopen (#260).
@@ -473,7 +483,36 @@ export function Settings() {
 
   const handleStartEditCentralRepoPath = () => {
     setCentralRepoPathInput(centralRepoPathOverride ?? centralRepoPath);
+    setCentralRepoPathError(null);
     setEditingCentralRepoPath(true);
+  };
+
+  // Apply a destination the user has committed to (after any confirmation).
+  const applyCentralRepoPath = async (
+    path: string,
+    intent: "migrate" | "adopt" = "migrate"
+  ) => {
+    setSavingCentralRepoPath(true);
+    try {
+      await api.setCentralRepoPath(path, intent);
+      setCentralRepoPathError(null);
+      setEditingCentralRepoPath(false);
+      setCentralRepoPathOverride(path);
+      // Ask the backend rather than deciding here: whether anything is pending is
+      // exactly what it knows and the UI should not re-derive (adopt has no
+      // pending move, a migrate does).
+      setCentralRepoPendingTarget(await api.getCentralRepoPendingTarget());
+      toast.success(t("settings.repoPathSaved"));
+      toast.info(t("settings.repoPathRestartNotice"));
+    } catch (error) {
+      // Surface the reason next to the field, where the user is looking — a
+      // failure that only appears in About (or at the next launch) is exactly
+      // what made #449/#469 so hard to diagnose.
+      setCentralRepoPathError(getErrorMessage(error, t("common.error")));
+      toast.error(getErrorMessage(error, t("common.error")));
+    } finally {
+      setSavingCentralRepoPath(false);
+    }
   };
 
   const handleSaveCentralRepoPath = async () => {
@@ -483,15 +522,45 @@ export function Settings() {
       return;
     }
     setSavingCentralRepoPath(true);
+    setCentralRepoPathError(null);
     try {
-      const nextPath = await api.setCentralRepoPath(trimmed);
-      setCentralRepoPath(nextPath);
-      setCentralRepoPathOverride(nextPath);
-      setEditingCentralRepoPath(false);
-      toast.success(t("settings.repoPathSaved"));
-      toast.info(t("settings.repoPathRestartNotice"));
+      // Look at the destination before committing, so "this folder is not
+      // empty" is answerable here rather than at the next launch.
+      const inspection = await api.inspectCentralRepoTarget(trimmed);
+      if (inspection.kind === "notEmpty") {
+        setCentralRepoPathError(t("settings.repoPathNotACentralRepo"));
+        return;
+      }
+      if (inspection.kind === "existingLibrary") {
+        setExistingLibraryPrompt({
+          path: inspection.requestedPath,
+          skillCount: inspection.skillCount,
+        });
+        return;
+      }
+      await applyCentralRepoPath(inspection.requestedPath, "migrate");
     } catch (error) {
-      toast.error(String(error));
+      setCentralRepoPathError(getErrorMessage(error, t("common.error")));
+      toast.error(getErrorMessage(error, t("common.error")));
+    } finally {
+      setSavingCentralRepoPath(false);
+    }
+  };
+
+  const handleCancelPendingMigration = async () => {
+    setSavingCentralRepoPath(true);
+    try {
+      await api.cancelCentralRepoMigration();
+      setCentralRepoPendingTarget(null);
+      setCentralRepoPathOverride(null);
+      setEditingCentralRepoPath(false);
+      setCentralRepoPathError(null);
+      const current = await api.getCentralRepoPath();
+      setCentralRepoPath(current);
+      setCentralRepoPathInput(current);
+      toast.success(t("settings.repoPathMigrationCancelled"));
+    } catch (error) {
+      toast.error(getErrorMessage(error, t("common.error")));
     } finally {
       setSavingCentralRepoPath(false);
     }
@@ -499,16 +568,17 @@ export function Settings() {
 
   const handleResetCentralRepoPath = async () => {
     setSavingCentralRepoPath(true);
+    setCentralRepoPathError(null);
     try {
-      const nextPath = await api.setCentralRepoPath(null);
-      setCentralRepoPath(nextPath);
+      await api.setCentralRepoPath(null, "migrate");
+      const target = await api.getCentralRepoPendingTarget();
+      setCentralRepoPendingTarget(target);
       setCentralRepoPathOverride(null);
-      setCentralRepoPathInput(nextPath);
       setEditingCentralRepoPath(false);
       toast.success(t("settings.repoPathReset"));
       toast.info(t("settings.repoPathRestartNotice"));
     } catch (error) {
-      toast.error(String(error));
+      toast.error(getErrorMessage(error, t("common.error")));
     } finally {
       setSavingCentralRepoPath(false);
     }
@@ -1282,6 +1352,7 @@ export function Settings() {
                       type="button"
                       onClick={() => {
                         setCentralRepoPathInput(centralRepoPathOverride ?? centralRepoPath);
+                        setCentralRepoPathError(null);
                         setEditingCentralRepoPath(false);
                       }}
                       disabled={savingCentralRepoPath}
@@ -1321,6 +1392,17 @@ export function Settings() {
                     {t("settings.resetPath")}
                   </button>
                 )}
+                {!editingCentralRepoPath && centralRepoPendingTarget && (
+                  <button
+                    type="button"
+                    onClick={() => void handleCancelPendingMigration()}
+                    disabled={savingCentralRepoPath}
+                    className={`${actionButtonClass} text-muted hover:text-secondary`}
+                  >
+                    <X className="w-3 h-3" />
+                    {t("settings.cancelPathChange")}
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={handleOpenRepoInFinder}
@@ -1340,10 +1422,24 @@ export function Settings() {
                   {t("settings.openInFinder")}
                 </button>
               </div>
-              <div className="w-full text-[12px] text-muted">
-                {centralRepoPathOverride
-                  ? t("settings.repoPathCustomHint")
-                  : t("settings.repoPathDefaultHint")}
+              <div className="w-full space-y-1 text-[12px] text-muted">
+                {/* The field names where the data *is*; this names where it is
+                    going. Showing only one of the two is what made this setting
+                    read as "saved but not applied" (#449/#469). */}
+                {centralRepoPendingTarget ? (
+                  <p className="text-amber-700 dark:text-amber-300">
+                    {t("settings.repoPathPendingNotice", {
+                      target: compactHomePath(centralRepoPendingTarget),
+                    })}
+                  </p>
+                ) : centralRepoPathOverride ? (
+                  <p>{t("settings.repoPathCustomHint")}</p>
+                ) : (
+                  <p>{t("settings.repoPathDefaultHint")}</p>
+                )}
+                {centralRepoPathError && (
+                  <p className="text-red-600 dark:text-red-300">{centralRepoPathError}</p>
+                )}
               </div>
             </div>
 
@@ -1868,6 +1964,26 @@ export function Settings() {
           </div>
         </section>
       </div>
+
+      {/* A destination that already holds a library: ask which the user meant.
+          Switching to it silently would turn "move my library" into "use that
+          one instead", and the data difference is not recoverable by a toggle. */}
+      <ConfirmDialog
+        open={existingLibraryPrompt !== null}
+        tone="warning"
+        title={t("settings.repoPathExistingTitle")}
+        message={t("settings.repoPathExistingMessage", {
+          count: existingLibraryPrompt?.skillCount ?? 0,
+          path: existingLibraryPrompt ? compactHomePath(existingLibraryPrompt.path) : "",
+        })}
+        confirmLabel={t("settings.repoPathExistingUseIt")}
+        onClose={() => setExistingLibraryPrompt(null)}
+        onConfirm={async () => {
+          const prompt = existingLibraryPrompt;
+          setExistingLibraryPrompt(null);
+          if (prompt) await applyCentralRepoPath(prompt.path, "adopt");
+        }}
+      />
     </div>
   );
 }

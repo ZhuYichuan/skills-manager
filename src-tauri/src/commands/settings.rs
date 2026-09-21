@@ -87,6 +87,8 @@ pub async fn set_settings(
 
 #[tauri::command]
 pub fn get_central_repo_path() -> String {
+    // The Live Location (ADR 0001): "Open folder" and this field must point at
+    // where the data actually is, or the field lies — which is what #469 hit.
     central_repo::base_dir().to_string_lossy().to_string()
 }
 
@@ -95,20 +97,53 @@ pub fn get_central_repo_path_override() -> Option<String> {
     central_repo::configured_base_dir().map(|path| path.to_string_lossy().to_string())
 }
 
-/// Warning codes recorded while resolving the central repository at startup
-/// (e.g. unreadable config, invalid configured path). Non-empty means the app
-/// fell back to the default location and the user should be told (#228).
+/// The pending destination, if the library is headed somewhere other than where
+/// it is now. Lets the UI distinguish "this is where my library lives" from
+/// "this is where it will live after a restart".
+#[tauri::command]
+pub fn get_central_repo_pending_target() -> Option<String> {
+    central_repo::pending_switch_target().map(|path| path.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 pub fn get_central_repo_warnings() -> Vec<String> {
     central_repo::startup_warnings()
 }
 
+/// Inspect a destination the user picked, without committing to anything.
+///
+/// Runs before saving so "this folder is not empty" surfaces where the user can
+/// still change their answer, instead of as a startup failure they may only
+/// notice once the library misbehaves (#449/#469).
 #[tauri::command]
-pub async fn set_central_repo_path(path: Option<String>) -> Result<String, AppError> {
+pub async fn inspect_central_repo_target(
+    path: String,
+) -> Result<central_repo::TargetInspection, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
-        central_repo::set_base_dir_override(path)
+        central_repo::inspect_target(&path).map_err(AppError::io)
+    })
+    .await?
+}
+
+#[tauri::command]
+pub async fn set_central_repo_path(
+    path: Option<String>,
+    intent: Option<central_repo::RepoPathIntent>,
+) -> Result<String, AppError> {
+    let intent = intent.unwrap_or(central_repo::RepoPathIntent::Migrate);
+    tauri::async_runtime::spawn_blocking(move || {
+        central_repo::set_base_dir_override(path, intent)
             .map(|resolved| resolved.to_string_lossy().to_string())
             .map_err(AppError::io)
+    })
+    .await?
+}
+
+/// Abandon a Pending Migration and stay where the data is.
+#[tauri::command]
+pub async fn cancel_central_repo_migration() -> Result<(), AppError> {
+    tauri::async_runtime::spawn_blocking(|| {
+        central_repo::cancel_pending_migration().map_err(AppError::io)
     })
     .await?
 }
