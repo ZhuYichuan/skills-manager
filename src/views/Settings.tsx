@@ -179,7 +179,10 @@ export function Settings() {
   const [centralRepoPendingTarget, setCentralRepoPendingTarget] = useState<string | null>(null);
   const [centralRepoPathError, setCentralRepoPathError] = useState<string | null>(null);
   const [existingLibraryPrompt, setExistingLibraryPrompt] = useState<{
-    path: string;
+    /** What to save on confirm; `null` means the default location. */
+    requested: string | null;
+    /** The same place, for display in the message. */
+    display: string;
     skillCount: number;
   } | null>(null);
   const [editingCentralRepoPath, setEditingCentralRepoPath] = useState(false);
@@ -488,8 +491,10 @@ export function Settings() {
   };
 
   // Apply a destination the user has committed to (after any confirmation).
+  // `null` means the default location, which must be stored as "no path" rather
+  // than as that path written out — otherwise the UI would call it custom.
   const applyCentralRepoPath = async (
-    path: string,
+    path: string | null,
     intent: "migrate" | "adopt" = "migrate"
   ) => {
     setSavingCentralRepoPath(true);
@@ -497,11 +502,14 @@ export function Settings() {
       await api.setCentralRepoPath(path, intent);
       setCentralRepoPathError(null);
       setEditingCentralRepoPath(false);
-      setCentralRepoPathOverride(path);
-      // Ask the backend rather than deciding here: whether anything is pending is
-      // exactly what it knows and the UI should not re-derive (adopt has no
-      // pending move, a migrate does).
-      setCentralRepoPendingTarget(await api.getCentralRepoPendingTarget());
+      // Re-read rather than assume: only the backend knows whether the save left
+      // anything pending and what the resulting hint should say.
+      const [override, pending] = await Promise.all([
+        api.getCentralRepoPathOverride(),
+        api.getCentralRepoPendingTarget(),
+      ]);
+      setCentralRepoPathOverride(override);
+      setCentralRepoPendingTarget(pending);
       toast.success(t("settings.repoPathSaved"));
       toast.info(t("settings.repoPathRestartNotice"));
     } catch (error) {
@@ -533,7 +541,8 @@ export function Settings() {
       }
       if (inspection.kind === "existingLibrary") {
         setExistingLibraryPrompt({
-          path: inspection.requestedPath,
+          requested: inspection.requestedPath,
+          display: inspection.requestedPath,
           skillCount: inspection.skillCount,
         });
         return;
@@ -595,13 +604,26 @@ export function Settings() {
     setSavingCentralRepoPath(true);
     setCentralRepoPathError(null);
     try {
-      await api.setCentralRepoPath(null, "migrate");
-      const target = await api.getCentralRepoPendingTarget();
-      setCentralRepoPendingTarget(target);
-      setCentralRepoPathOverride(null);
-      setEditingCentralRepoPath(false);
-      toast.success(t("settings.repoPathReset"));
-      toast.info(t("settings.repoPathRestartNotice"));
+      // "Reset to default" is a path change like any other, so it gets the same
+      // precheck. Without it, a default location that already holds a library of
+      // its own would refuse the move forever — the safety rule never merges over
+      // user data — leaving a pending notice the user could not clear and no way
+      // to say "just use the library that is already there".
+      const defaultPath = await api.getDefaultCentralRepoPath();
+      const inspection = await api.inspectCentralRepoTarget(defaultPath);
+      if (inspection.kind === "notEmpty") {
+        setCentralRepoPathError(t("settings.repoPathDefaultOccupied"));
+        return;
+      }
+      if (inspection.kind === "existingLibrary") {
+        setExistingLibraryPrompt({
+          requested: null,
+          display: defaultPath,
+          skillCount: inspection.skillCount,
+        });
+        return;
+      }
+      await applyCentralRepoPath(null, "migrate");
     } catch (error) {
       toast.error(getErrorMessage(error, t("common.error")));
     } finally {
@@ -2010,14 +2032,14 @@ export function Settings() {
         title={t("settings.repoPathExistingTitle")}
         message={t("settings.repoPathExistingMessage", {
           count: existingLibraryPrompt?.skillCount ?? 0,
-          path: existingLibraryPrompt ? compactHomePath(existingLibraryPrompt.path) : "",
+          path: existingLibraryPrompt ? compactHomePath(existingLibraryPrompt.display) : "",
         })}
         confirmLabel={t("settings.repoPathExistingUseIt")}
         onClose={() => setExistingLibraryPrompt(null)}
         onConfirm={async () => {
           const prompt = existingLibraryPrompt;
           setExistingLibraryPrompt(null);
-          if (prompt) await applyCentralRepoPath(prompt.path, "adopt");
+          if (prompt) await applyCentralRepoPath(prompt.requested, "adopt");
         }}
       />
     </div>

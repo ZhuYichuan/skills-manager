@@ -461,6 +461,10 @@ export const getCentralRepoPathOverride = () =>
 export const getCentralRepoPendingTarget = () =>
   invoke<string | null>("get_central_repo_pending_target");
 
+/** Where the app falls back to when no Central Repo Path is configured. */
+export const getDefaultCentralRepoPath = () =>
+  invoke<string>("get_default_central_repo_path");
+
 /** What a chosen destination turned out to hold (see `TargetInspection`). */
 export type CentralRepoPathOutcome =
   | { kind: "empty"; requestedPath: string }

@@ -114,6 +114,15 @@ fn default_base_dir() -> PathBuf {
     home_base_dir()
 }
 
+/// The location the app falls back to when no Central Repo Path is configured.
+///
+/// Exposed so the UI can inspect it before "reset to default": the default may
+/// already hold a library, and the same safety rule that refuses to migrate over
+/// user data would then leave the setting stuck on a permanent pending notice.
+pub fn default_repo_path() -> PathBuf {
+    default_base_dir()
+}
+
 /// `~/.skills-manager`, ignoring any configured relocation.
 ///
 /// The library can be moved anywhere the user likes, but a few things must
@@ -1727,6 +1736,37 @@ mod tests {
             "cancelling must not strand the session on an empty default"
         );
         assert!(other.join("skills").exists());
+
+        set_test_config_path_override(None);
+        set_test_home_dir_override(None);
+        set_runtime_base_dir_override(None);
+    }
+
+    /// Adopting the default location — what the UI's "reset to default" does when
+    /// the default already holds a library. It must store "no path" rather than
+    /// that path written out, or the UI would start calling the default custom.
+    #[test]
+    fn adopting_the_default_location_stores_no_path() {
+        let _guard = test_base_dir_lock();
+        let home = tempfile::tempdir().unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        set_test_home_dir_override(Some(home.path().to_path_buf()));
+        set_test_config_path_override(Some(cfg_dir.path().join(CONFIG_FILE_NAME)));
+        set_runtime_base_dir_override(None);
+
+        let live = home.path().join("elsewhere");
+        fs::create_dir_all(live.join("skills")).unwrap();
+        set_runtime_base_dir_override(Some(live.clone()));
+
+        set_base_dir_override(None, RepoPathIntent::Adopt).unwrap();
+
+        let config = load_config();
+        assert_eq!(config.repo_path, None, "the default must stay 'no path'");
+        assert_eq!(config.pending_migration_from, None, "nothing to migrate");
+        // This session keeps using the data it already has...
+        assert_eq!(base_dir(), live);
+        // ...and the next one resolves to the default.
+        assert_eq!(live_base_dir(&config), home.path().join(".skills-manager"));
 
         set_test_config_path_override(None);
         set_test_home_dir_override(None);

@@ -623,6 +623,7 @@
     "repoPathCustomHint": "Using a custom central repository path",
     "repoPathPendingNotice": "Scheduled to switch to {{target}} on the next restart; until it completes, the data stays at its current location.",
     "repoPathNotACentralRepo": "That folder already contains other files, so it cannot be the central repository. Please choose an empty folder.",
+    "repoPathDefaultOccupied": "The default location ~/.skills-manager already contains other files, so the library cannot be moved back. Clear that folder, or choose an empty one.",
     "repoPathExistingTitle": "This folder already holds a library",
     "repoPathExistingMessage": "{{path}} already contains a Skills Manager library ({{count}} skills). Use it, or pick an empty folder to migrate your current library into. Using it switches to that data — nothing is copied or merged.",
     "repoPathExistingUseIt": "Use this library",

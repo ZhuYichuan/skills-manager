@@ -623,6 +623,7 @@
     "repoPathCustomHint": "当前使用自定义中央仓库路径",
     "repoPathPendingNotice": "已安排在下次启动时切换到 {{target}}；在切换完成前，数据仍保留在当前位置。",
     "repoPathNotACentralRepo": "该文件夹里已有其它文件，无法作为中央仓库。请选择一个空文件夹。",
+    "repoPathDefaultOccupied": "默认位置 ~/.skills-manager 里已有其它文件，无法迁回。请手动清理该目录，或改选一个空文件夹。",
     "repoPathExistingTitle": "该文件夹已存在技能库",
     "repoPathExistingMessage": "{{path}} 中已有一个技能库（{{count}} 个技能）。你可以直接使用它，或改选一个空文件夹来迁移当前的库。使用它将切换到那一份数据，不会复制或合并。",
     "repoPathExistingUseIt": "使用这个技能库",

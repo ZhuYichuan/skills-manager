@@ -1048,6 +1048,7 @@ pub fn run() {
             commands::settings::get_central_repo_path,
             commands::settings::get_central_repo_path_override,
             commands::settings::get_central_repo_pending_target,
+            commands::settings::get_default_central_repo_path,
             commands::settings::get_central_repo_warnings,
             commands::settings::inspect_central_repo_target,
             commands::settings::set_central_repo_path,

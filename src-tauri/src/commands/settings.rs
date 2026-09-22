@@ -97,6 +97,15 @@ pub fn get_central_repo_path_override() -> Option<String> {
     central_repo::configured_base_dir().map(|path| path.to_string_lossy().to_string())
 }
 
+/// The location used when no Central Repo Path is configured. The UI inspects it
+/// before "reset to default", because the default may already hold a library.
+#[tauri::command]
+pub fn get_default_central_repo_path() -> String {
+    central_repo::default_repo_path()
+        .to_string_lossy()
+        .to_string()
+}
+
 /// The pending destination, if the library is headed somewhere other than where
 /// it is now. Lets the UI distinguish "this is where my library lives" from
 /// "this is where it will live after a restart".
