@@ -1052,6 +1052,7 @@ pub fn run() {
             commands::settings::inspect_central_repo_target,
             commands::settings::set_central_repo_path,
             commands::settings::cancel_central_repo_migration,
+            commands::settings::repair_agent_links,
             commands::settings::open_central_repo_folder,
             commands::settings::check_app_update,
             commands::settings::update_install_blocker,

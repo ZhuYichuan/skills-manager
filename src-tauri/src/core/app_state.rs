@@ -92,6 +92,23 @@ fn initialize_store_inner(
         }
     }
 
+    // Then repair links that are already broken, whoever broke them. A move made
+    // by a build predating this repair left them dangling with no future move to
+    // trigger the pass above, and a copy-mode move leaves the link resolving at a
+    // stale copy. Runs every launch; it only touches dangling links whose target
+    // names a skill the current library actually has.
+    {
+        let step = Instant::now();
+        match relocation_repair::repair_stale_agent_links(&store) {
+            Ok(0) => {}
+            Ok(repaired) => log::info!(
+                "startup: repaired {repaired} stale agent link(s) in {} ms",
+                step.elapsed().as_millis()
+            ),
+            Err(err) => log::warn!("startup: stale agent link repair failed ({err:#})"),
+        }
+    }
+
     let step = Instant::now();
     tool_service::migrate_legacy_tool_keys(&store)
         .map_err(|e| anyhow::anyhow!(e.to_string()))

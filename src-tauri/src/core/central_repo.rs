@@ -328,7 +328,7 @@ pub(crate) fn set_test_base_dir_override(path: Option<PathBuf>) {
     set_runtime_skills_dir_override(None);
 }
 
-const SKILLS_DIR_NAME: &str = "skills";
+pub(crate) const SKILLS_DIR_NAME: &str = "skills";
 const SCENARIOS_DIR_NAME: &str = "scenarios";
 const CACHE_DIR_NAME: &str = "cache";
 const LOGS_DIR_NAME: &str = "logs";

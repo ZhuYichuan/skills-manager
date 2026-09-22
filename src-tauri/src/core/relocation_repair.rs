@@ -30,23 +30,51 @@ const MAX_DEPTH: usize = 4;
 ///
 /// Best-effort per link: one unreadable entry must not abandon the rest.
 pub fn repoint_agent_links(store: &SkillStore, from: &Path, to: &Path) -> Result<usize> {
+    let mut visit = |link: &Path| repoint_link(link, from, to);
     let mut repointed = 0;
     for root in file_watcher::collect_watch_paths(store) {
-        repointed += repoint_links_under(&root, from, to, 0)?;
+        repointed += walk_links(&root, 0, &mut visit)?;
     }
     Ok(repointed)
 }
 
-fn repoint_links_under(dir: &Path, from: &Path, to: &Path, depth: usize) -> Result<usize> {
+/// Re-point links that are already broken, whatever broke them.
+///
+/// A move performed by a build that predates the repair above left its links
+/// dangling with no future move to fix them, so waiting for the next relocation
+/// would never help those users. A `Copy`-mode relocation also leaves the old
+/// library in place, which means the links still *resolve* — to a stale copy —
+/// and only [`repoint_agent_links`] can tell that apart. Run both.
+///
+/// The test is deliberately narrow: only a **dangling** link whose target names a
+/// skill (`.../skills/<name>`) that exists in the current library. A link to the
+/// user's own directory is never touched, even if a skill happens to share its
+/// name.
+pub fn repair_stale_agent_links(store: &SkillStore) -> Result<usize> {
+    let skills_root = central_repo::skills_dir();
+    let mut visit = |link: &Path| repair_stale_link(link, &skills_root);
+    let mut repaired = 0;
+    for root in file_watcher::collect_watch_paths(store) {
+        repaired += walk_links(&root, 0, &mut visit)?;
+    }
+    Ok(repaired)
+}
+
+/// Visit every link under `dir` (without descending through one), counting the
+/// visits that report a change.
+fn walk_links(
+    dir: &Path,
+    depth: usize,
+    visit: &mut dyn FnMut(&Path) -> Result<bool>,
+) -> Result<usize> {
     if depth > MAX_DEPTH || !dir.is_dir() {
         return Ok(0);
     }
-    let mut repointed = 0;
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
+    let Ok(entries) = fs::read_dir(dir) else {
         // A root we cannot list is not a reason to skip the others.
-        Err(_) => return Ok(0),
+        return Ok(0);
     };
+    let mut changed = 0;
     for entry in entries.flatten() {
         let path = entry.path();
         let Ok(metadata) = fs::symlink_metadata(&path) else {
@@ -54,21 +82,19 @@ fn repoint_links_under(dir: &Path, from: &Path, to: &Path, depth: usize) -> Resu
         };
         let file_type = metadata.file_type();
         if file_type.is_symlink() {
-            match repoint_link(&path, from, to) {
-                Ok(true) => repointed += 1,
+            match visit(&path) {
+                Ok(true) => changed += 1,
                 Ok(false) => {}
-                Err(err) => {
-                    log::warn!("relocation: could not re-point {} ({err:#})", path.display());
-                }
+                Err(err) => log::warn!("relocation: {} ({err:#})", path.display()),
             }
             // Never descend through a link: it may point outside the tree.
             continue;
         }
         if file_type.is_dir() {
-            repointed += repoint_links_under(&path, from, to, depth + 1)?;
+            changed += walk_links(&path, depth + 1, visit)?;
         }
     }
-    Ok(repointed)
+    Ok(changed)
 }
 
 /// Point one link at the relocated counterpart of its target, if it points into
@@ -110,6 +136,51 @@ fn repoint_link(link: &Path, from: &Path, to: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// Repair one dangling link by aiming it at the same skill in the current
+/// library. Returns whether anything changed.
+fn repair_stale_link(link: &Path, skills_root: &Path) -> Result<bool> {
+    // A link that resolves is either fine or (after a copy-mode move) points at
+    // the stale source; only `repoint_agent_links` can tell those apart.
+    if fs::metadata(link).is_ok() {
+        return Ok(false);
+    }
+    let raw = fs::read_link(link)?;
+    let absolute = if raw.is_absolute() {
+        raw
+    } else {
+        link.parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(&raw)
+    };
+    let Some(name) = absolute.file_name() else {
+        return Ok(false);
+    };
+    // The old target must have been a skill in a library: `<something>/skills/<name>`.
+    // Without this check a dangling link to the user's own directory would be
+    // re-aimed at a same-named skill.
+    let aimed_at_a_skill = absolute
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|parent| parent == central_repo::SKILLS_DIR_NAME);
+    if !aimed_at_a_skill {
+        return Ok(false);
+    }
+
+    let candidate = skills_root.join(name);
+    if !candidate.is_dir() {
+        return Ok(false);
+    }
+
+    sync_engine::remove_link(link)?;
+    central_repo::create_dir_link(&candidate, link)?;
+    log::info!(
+        "relocation: repaired stale link {} -> {}",
+        link.display(),
+        candidate.display()
+    );
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,7 +209,8 @@ mod tests {
         std::os::unix::fs::symlink(elsewhere.path().join("other"), agent.path().join("other"))
             .unwrap();
 
-        let repointed = repoint_links_under(agent.path(), old.path(), new.path(), 0).unwrap();
+        let mut visit = |link: &Path| repoint_link(link, old.path(), new.path());
+        let repointed = walk_links(agent.path(), 0, &mut visit).unwrap();
 
         assert_eq!(repointed, 2, "only the two library links should move");
         assert_eq!(
@@ -177,7 +249,8 @@ mod tests {
             .unwrap();
         assert!(!agent.path().join("alpha").exists());
 
-        let repointed = repoint_links_under(agent.path(), old.path(), new.path(), 0).unwrap();
+        let mut visit = |link: &Path| repoint_link(link, old.path(), new.path());
+        let repointed = walk_links(agent.path(), 0, &mut visit).unwrap();
 
         assert_eq!(repointed, 1);
         assert!(agent.path().join("alpha").is_dir(), "now resolves");
@@ -192,10 +265,69 @@ mod tests {
         let agent = tempfile::tempdir().unwrap();
         fs::write(agent.path().join("real.md"), b"x").unwrap();
 
-        assert_eq!(
-            repoint_links_under(agent.path(), old.path(), new.path(), 0).unwrap(),
-            0
-        );
+        let mut visit = |link: &Path| repoint_link(link, old.path(), new.path());
+        assert_eq!(walk_links(agent.path(), 0, &mut visit).unwrap(), 0);
         assert!(agent.path().join("real.md").exists());
+    }
+
+    /// A link broken by an *earlier* build's relocation has no future move to fix
+    /// it, so the stale-link repair has to be able to.
+    #[cfg(unix)]
+    #[test]
+    fn repairs_a_link_left_dangling_by_an_older_build() {
+        let library = tempfile::tempdir().unwrap();
+        let gone = tempfile::tempdir().unwrap();
+        let agent = tempfile::tempdir().unwrap();
+
+        let skills_root = library.path().join(central_repo::SKILLS_DIR_NAME);
+        fs::create_dir_all(skills_root.join("grill-me")).unwrap();
+        fs::write(skills_root.join("grill-me/SKILL.md"), b"x").unwrap();
+
+        let link = agent.path().join("grill-me");
+        std::os::unix::fs::symlink(gone.path().join("skills/grill-me"), &link).unwrap();
+        assert!(!link.exists(), "dangling to start with");
+
+        assert!(repair_stale_link(&link, &skills_root).unwrap());
+        assert_eq!(fs::read_link(&link).unwrap(), skills_root.join("grill-me"));
+        assert!(link.join("SKILL.md").exists());
+    }
+
+    /// A dangling link that never pointed at a library is not ours to re-aim,
+    /// even when a skill happens to share its name.
+    #[cfg(unix)]
+    #[test]
+    fn does_not_re_aim_a_link_that_never_pointed_at_a_library() {
+        let library = tempfile::tempdir().unwrap();
+        let agent = tempfile::tempdir().unwrap();
+        let skills_root = library.path().join(central_repo::SKILLS_DIR_NAME);
+        fs::create_dir_all(skills_root.join("grill-me")).unwrap();
+
+        let user_dir = tempfile::tempdir().unwrap();
+        let link = agent.path().join("grill-me");
+        std::os::unix::fs::symlink(user_dir.path().join("grill-me"), &link).unwrap();
+
+        assert!(!repair_stale_link(&link, &skills_root).unwrap());
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            user_dir.path().join("grill-me")
+        );
+    }
+
+    /// A link that still resolves is left alone: after a copy-mode move it points
+    /// at the stale source, which only the migration-keyed repair may correct.
+    #[cfg(unix)]
+    #[test]
+    fn leaves_a_resolving_link_alone() {
+        let library = tempfile::tempdir().unwrap();
+        let agent = tempfile::tempdir().unwrap();
+        let skills_root = library.path().join(central_repo::SKILLS_DIR_NAME);
+        fs::create_dir_all(skills_root.join("grill-me")).unwrap();
+
+        let stale = tempfile::tempdir().unwrap();
+        fs::create_dir_all(stale.path().join("skills/grill-me")).unwrap();
+        let link = agent.path().join("grill-me");
+        std::os::unix::fs::symlink(stale.path().join("skills/grill-me"), &link).unwrap();
+
+        assert!(!repair_stale_link(&link, &skills_root).unwrap());
     }
 }

@@ -575,6 +575,22 @@ export function Settings() {
     }
   };
 
+  const handleRepairAgentLinks = async () => {
+    setSavingCentralRepoPath(true);
+    try {
+      const repaired = await api.repairAgentLinks();
+      if (repaired > 0) {
+        toast.success(t("settings.repairLinksDone", { count: repaired }));
+      } else {
+        toast.success(t("settings.repairLinksNone"));
+      }
+    } catch (error) {
+      toast.error(getErrorMessage(error, t("common.error")));
+    } finally {
+      setSavingCentralRepoPath(false);
+    }
+  };
+
   const handleResetCentralRepoPath = async () => {
     setSavingCentralRepoPath(true);
     setCentralRepoPathError(null);
@@ -1449,6 +1465,17 @@ export function Settings() {
                 {centralRepoPathError && (
                   <p className="text-red-600 dark:text-red-300">{centralRepoPathError}</p>
                 )}
+                {/* Agents deploy skills as links into the library, so a move can
+                    leave them dangling. Startup repairs them; this is the manual
+                    way out if a link was broken some other way. */}
+                <button
+                  type="button"
+                  onClick={() => void handleRepairAgentLinks()}
+                  disabled={savingCentralRepoPath}
+                  className="text-[12px] text-muted underline-offset-2 hover:text-secondary hover:underline disabled:opacity-50"
+                >
+                  {t("settings.repairLinks")}
+                </button>
               </div>
             </div>
 

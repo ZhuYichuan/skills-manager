@@ -148,6 +148,20 @@ pub async fn cancel_central_repo_migration() -> Result<(), AppError> {
     .await?
 }
 
+/// Re-point agent-side links left dangling by a relocation. Runs automatically at
+/// startup; exposed as a command so a user can force it after moving a library by
+/// hand, or after repairing the library directory themselves.
+#[tauri::command]
+pub async fn repair_agent_links(
+    store: State<'_, Arc<SkillStore>>,
+) -> Result<usize, AppError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::core::relocation_repair::repair_stale_agent_links(&store).map_err(AppError::io)
+    })
+    .await?
+}
+
 #[tauri::command]
 pub async fn open_central_repo_folder() -> Result<(), AppError> {
     tauri::async_runtime::spawn_blocking(|| {

@@ -473,6 +473,10 @@ export const inspectCentralRepoTarget = (path: string) =>
 export const cancelCentralRepoMigration = () =>
   invoke<void>("cancel_central_repo_migration");
 
+/** Re-point agent-side links left dangling by a relocation; returns how many. */
+export const repairAgentLinks = () =>
+  invoke<number>("repair_agent_links");
+
 export const getCentralRepoWarnings = () =>
   invoke<string[]>("get_central_repo_warnings");
 
