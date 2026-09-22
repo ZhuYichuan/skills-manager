@@ -640,9 +640,37 @@ fn read_library_skill_count(base: &Path) -> Option<usize> {
     Some(count.max(0) as usize)
 }
 
+/// Names the operating system, not the user, drops into a directory: Finder view
+/// state, Windows thumbnail and folder config, AppleDouble resource forks.
+///
+/// None of them is user data, and a folder the user has merely *looked at* in
+/// Finder has a `.DS_Store` — so without this an otherwise empty destination was
+/// un-migratable on macOS, and the pending move retried forever.
+fn is_os_metadata_name(name: &str) -> bool {
+    matches!(name, ".DS_Store" | "desktop.ini" | "Thumbs.db" | ".localized")
+        || name.starts_with("._")
+}
+
+/// Whether `dir` contains nothing but the OS's own metadata files, and so counts
+/// as empty for migration purposes.
+fn dir_holds_only_os_metadata(dir: &Path) -> Result<bool> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Ok(false);
+        };
+        if !is_os_metadata_name(name) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Whether `entry` is something the app itself leaves in a library location
-/// before any migration runs: the write lock file, or one of the bare skeleton
-/// directories.
+/// before any migration runs: the write lock file, one of the bare skeleton
+/// directories, or the CLI bridge directory. OS metadata never counts as
+/// content either.
 ///
 /// Every other name counts as content — deliberately including
 /// `skills-manager.db` and `.secret.key`, which this app also creates. Those
@@ -660,12 +688,16 @@ fn is_app_owned_debris(entry: &fs::DirEntry) -> Result<bool> {
         // An undecodable name is something we did not write.
         return Ok(false);
     };
+    if is_os_metadata_name(name) {
+        return Ok(true);
+    }
     let file_type = entry.file_type()?;
     if name == crate::core::repo_lock::LOCK_FILE_NAME {
         return Ok(file_type.is_file());
     }
     if SKELETON_DIR_NAMES.contains(&name) {
-        return Ok(file_type.is_dir() && fs::read_dir(entry.path())?.next().is_none());
+        // A skeleton holding only OS metadata is still a bare skeleton.
+        return Ok(file_type.is_dir() && dir_holds_only_os_metadata(&entry.path())?);
     }
     if name == CLI_BRIDGE_DIR_NAME {
         // The bridge is debris only while it holds nothing but its own files. A
@@ -683,6 +715,9 @@ fn bridge_dir_is_owned(dir: &Path) -> Result<bool> {
         let Some(name) = name.to_str() else {
             return Ok(false);
         };
+        if is_os_metadata_name(name) && entry.file_type()?.is_file() {
+            continue;
+        }
         if !crate::core::cli_bridge::is_bridge_owned_file_name(name) || !entry.file_type()?.is_file() {
             return Ok(false);
         }
@@ -1476,6 +1511,55 @@ mod tests {
             target_has_user_data(dir.path()).unwrap(),
             "a foreign file inside bin must block the move"
         );
+    }
+
+    /// The operating system drops metadata into any directory the user has looked
+    /// at in Finder, so a destination can be otherwise empty and still hold one.
+    /// Treating it as content made migrating back to the default impossible on
+    /// macOS, and the pending move retried on every launch.
+    #[test]
+    fn target_holding_only_os_metadata_is_migratable() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [".DS_Store", "desktop.ini", "Thumbs.db"] {
+            fs::write(dir.path().join(name), b"os junk").unwrap();
+        }
+        assert!(
+            !target_has_user_data(dir.path()).unwrap(),
+            "OS metadata alone is not user data"
+        );
+
+        // A skeleton holding only OS metadata is still a bare skeleton.
+        let skeleton = dir.path().join("skills");
+        fs::create_dir_all(&skeleton).unwrap();
+        fs::write(skeleton.join(".DS_Store"), b"junk").unwrap();
+        assert!(
+            !target_has_user_data(dir.path()).unwrap(),
+            "a skeleton with only OS metadata is still empty"
+        );
+
+        // A real file next to it still blocks the move.
+        fs::write(skeleton.join("mine.md"), b"user").unwrap();
+        assert!(
+            target_has_user_data(dir.path()).unwrap(),
+            "real content must still block the move"
+        );
+    }
+
+    /// End to end: an empty default location that Finder has touched must still
+    /// accept the migration.
+    #[test]
+    fn migration_into_a_target_holding_only_os_metadata_moves() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::create_dir_all(src.path().join("skills")).unwrap();
+        fs::write(src.path().join("skills/s.md"), b"skill").unwrap();
+        fs::write(dst.path().join(".DS_Store"), b"finder junk").unwrap();
+
+        let mut config = config_migrating(src.path(), dst.path());
+        let outcome = migrate_repo_if_needed(&mut config, dst.path());
+
+        assert!(matches!(outcome, MigrationOutcome::Proceed), "got {outcome:?}");
+        assert!(dst.path().join("skills/s.md").exists());
     }
 
     // ── save-then-restart round trip (the #449/#469 report) ──
