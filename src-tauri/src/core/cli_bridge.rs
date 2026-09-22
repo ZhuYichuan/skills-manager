@@ -34,11 +34,26 @@ use std::process::Command;
 
 use super::central_repo;
 
-const BRIDGE_BIN_NAME: &str = if cfg!(windows) {
+/// Files the bridge directory legitimately contains. Named here so a caller that
+/// needs to recognise the bridge directory (relocation's debris check) does not
+/// keep a second list that can drift — the same mistake the skeleton
+/// directories made.
+pub(crate) const BRIDGE_BIN_NAME: &str = if cfg!(windows) {
     "skills-manager-cli.exe"
 } else {
     "skills-manager-cli"
 };
+pub(crate) const BRIDGE_STAMP_NAME: &str = ".version";
+const BRIDGE_STAGED_NAME: &str = if cfg!(windows) {
+    ".skills-manager-cli.exe.staged"
+} else {
+    ".skills-manager-cli.staged"
+};
+
+/// Whether `name` is a file the CLI bridge owns inside [`bridge_dir`].
+pub(crate) fn is_bridge_owned_file_name(name: &str) -> bool {
+    name == BRIDGE_BIN_NAME || name == BRIDGE_STAMP_NAME || name == BRIDGE_STAGED_NAME
+}
 
 /// Where the bridge lives. Deliberately the home directory rather than
 /// `central_repo::base_dir()`: the library can be relocated to anywhere the
@@ -52,7 +67,7 @@ pub fn bridge_path() -> PathBuf {
 }
 
 fn stamp_path() -> PathBuf {
-    bridge_dir().join(".version")
+    bridge_dir().join(BRIDGE_STAMP_NAME)
 }
 
 /// The CLI that shipped alongside the running app binary.
@@ -195,7 +210,7 @@ fn publish_from(source: &Path, app_version: &str) -> Result<PathBuf> {
         .with_context(|| format!("could not create {}", dir.display()))?;
 
     // Copy beside the target so the rename stays on one filesystem.
-    let staged = dir.join(format!(".{BRIDGE_BIN_NAME}.staged"));
+    let staged = dir.join(BRIDGE_STAGED_NAME);
     let _ = std::fs::remove_file(&staged);
     std::fs::copy(source, &staged)
         .with_context(|| format!("could not copy {} to {}", source.display(), staged.display()))?;

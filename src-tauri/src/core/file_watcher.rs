@@ -151,7 +151,7 @@ fn self_write_muted() -> bool {
     muted_at(now_ms(), mute_state().lock().unwrap().deadline_ms)
 }
 
-fn collect_watch_paths(store: &SkillStore) -> Vec<PathBuf> {
+pub(crate) fn collect_watch_paths(store: &SkillStore) -> Vec<PathBuf> {
     let mut paths = vec![central_repo::skills_dir(), central_repo::scenarios_dir()];
 
     for adapter in tool_adapters::all_tool_adapters(store) {

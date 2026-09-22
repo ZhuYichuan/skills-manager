@@ -366,7 +366,7 @@ pub fn sync_skill(
                                     target,
                                     source
                                 );
-                                copy_dir_recursive(source, target)?;
+                                copy_skill_payload(source, target)?;
                                 Ok(SyncMode::Copy)
                             }
                         }
@@ -375,12 +375,12 @@ pub fn sync_skill(
             }
             #[cfg(all(not(unix), not(windows)))]
             {
-                copy_dir_recursive(source, target)?;
+                copy_skill_payload(source, target)?;
                 Ok(SyncMode::Copy)
             }
         }
         SyncMode::Copy => {
-            copy_dir_recursive(source, target)?;
+            copy_skill_payload(source, target)?;
             Ok(SyncMode::Copy)
         }
     }
@@ -512,7 +512,7 @@ pub fn matches_recorded_deployment(target: &Path, recorded_mode: &str) -> Result
 
 /// Unlink a symlink (or, on Windows, a directory symlink / junction) without
 /// following it.
-fn remove_link(target: &Path) -> Result<()> {
+pub(crate) fn remove_link(target: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::FileTypeExt;
@@ -589,7 +589,7 @@ pub fn remove_target(target: &Path) -> Result<()> {
     Ok(())
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+fn copy_skill_payload(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -600,7 +600,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
             if name == ".git" {
                 continue;
             }
-            copy_dir_recursive(&entry.path(), &dest_path)?;
+            copy_skill_payload(&entry.path(), &dest_path)?;
         } else {
             std::fs::copy(entry.path(), &dest_path)?;
         }
@@ -1080,10 +1080,10 @@ mod tests {
         );
     }
 
-    // ── copy_dir_recursive ──
+    // ── copy_skill_payload ──
 
     #[test]
-    fn copy_dir_recursive_skips_dot_git() {
+    fn copy_skill_payload_skips_dot_git() {
         let tmp = tempdir().unwrap();
         let src = tmp.path().join("src");
         fs::create_dir_all(src.join(".git")).unwrap();
@@ -1093,7 +1093,7 @@ mod tests {
         fs::write(src.join("root.md"), "root").unwrap();
 
         let dst = tmp.path().join("dst");
-        copy_dir_recursive(&src, &dst).unwrap();
+        copy_skill_payload(&src, &dst).unwrap();
 
         assert!(!dst.join(".git").exists());
         assert!(dst.join("subdir/file.md").exists());

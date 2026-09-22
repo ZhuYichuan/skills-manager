@@ -21,6 +21,30 @@ static SKILLS_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static STARTUP_WARNINGS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 static STARTUP_ERROR_LOG: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
+/// The relocation this startup performed, if any, as `(from, to)`.
+///
+/// Recorded here because repairing the agent-side links that point into the
+/// library needs the adapters and projects that live behind the store — and this
+/// runs before the store is open. `initialize_store_inner` drains it once the
+/// store exists.
+static LAST_MIGRATION: OnceLock<Mutex<Option<(PathBuf, PathBuf)>>> = OnceLock::new();
+
+fn record_migration(from: &Path, to: &Path) {
+    *LAST_MIGRATION
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some((from.to_path_buf(), to.to_path_buf()));
+}
+
+/// Take the relocation this startup performed, if any.
+pub fn take_last_migration() -> Option<(PathBuf, PathBuf)> {
+    LAST_MIGRATION
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
 fn push_startup_warning(code: &str) {
     let mut warnings = STARTUP_WARNINGS
         .get_or_init(|| Mutex::new(Vec::new()))
@@ -319,6 +343,13 @@ const SKELETON_DIR_NAMES: [&str; 4] = [
     CACHE_DIR_NAME,
     LOGS_DIR_NAME,
 ];
+
+/// The CLI bridge directory, created by `cli_bridge` at the *home* location
+/// rather than at `base_dir()` — deliberately, so a skill can name it without
+/// asking where the library went. That also means it is always present in the
+/// default library location, so without this exclusion migrating *back* to the
+/// default could never succeed: the target would always read as non-empty.
+const CLI_BRIDGE_DIR_NAME: &str = "bin";
 
 pub fn skills_dir() -> PathBuf {
     if let Some(path) = SKILLS_DIR_OVERRIDE
@@ -636,7 +667,27 @@ fn is_app_owned_debris(entry: &fs::DirEntry) -> Result<bool> {
     if SKELETON_DIR_NAMES.contains(&name) {
         return Ok(file_type.is_dir() && fs::read_dir(entry.path())?.next().is_none());
     }
+    if name == CLI_BRIDGE_DIR_NAME {
+        // The bridge is debris only while it holds nothing but its own files. A
+        // `bin/` with anything else in it is the user's, and must block the move.
+        return Ok(file_type.is_dir() && bridge_dir_is_owned(&entry.path())?);
+    }
     Ok(false)
+}
+
+/// Whether a `bin/` directory contains nothing but CLI-bridge files.
+fn bridge_dir_is_owned(dir: &Path) -> Result<bool> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Ok(false);
+        };
+        if !crate::core::cli_bridge::is_bridge_owned_file_name(name) || !entry.file_type()?.is_file() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Whether `path` holds anything the user would miss if it were overwritten.
@@ -657,7 +708,19 @@ fn target_has_user_data(path: &Path) -> Result<bool> {
     Ok(false)
 }
 
-fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
+/// Copy a whole library tree, preserving symbolic links.
+///
+/// Deliberately not shared with `sync_engine`'s payload copy, which serves the
+/// opposite need: that one copies a single skill's contents and skips `.git`,
+/// while a library move must carry `skills/.git` (the backup repository). Two
+/// callers, two jobs — the shared name was the only thing they had in common.
+///
+/// Links are recreated, never followed. Following them failed outright for a
+/// directory link ("the source path is neither a regular file nor a symlink to a
+/// regular file") and silently turned a file link into a real file. A directory
+/// link aborting the copy also aborted the whole relocation, putting the user
+/// back on the retry-forever loop (#449/#469) whenever the library contained one.
+fn copy_library_tree(source: &Path, target: &Path) -> Result<()> {
     for entry in WalkDir::new(source) {
         let entry = entry?;
         let relative = entry.path().strip_prefix(source)?;
@@ -669,22 +732,94 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
             continue;
         }
         let destination = target.join(relative);
-        if entry.file_type().is_dir() {
-            fs::create_dir_all(&destination)?;
-        } else {
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(entry.path(), &destination).with_context(|| {
-                format!(
-                    "Failed to copy {} to {}",
-                    entry.path().display(),
-                    destination.display()
-                )
-            })?;
+        let file_type = entry.file_type();
+        if file_type.is_symlink() {
+            copy_link(entry.path(), &destination, source, target)?;
+            continue;
         }
+        if file_type.is_dir() {
+            fs::create_dir_all(&destination)?;
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(entry.path(), &destination).with_context(|| {
+            format!(
+                "Failed to copy {} to {}",
+                entry.path().display(),
+                destination.display()
+            )
+        })?;
     }
     Ok(())
+}
+
+/// Recreate the link at `destination` without following it.
+///
+/// An absolute target that pointed inside the old tree is re-based onto the new
+/// one, so a link aimed at another part of the library keeps working. A relative
+/// target is left alone: the whole tree moves together, so it still resolves.
+fn copy_link(link: &Path, destination: &Path, source_root: &Path, target_root: &Path) -> Result<()> {
+    let raw = fs::read_link(link)
+        .with_context(|| format!("Failed to read symlink {}", link.display()))?;
+    let target = match raw.strip_prefix(source_root) {
+        Ok(relative) if raw.is_absolute() => target_root.join(relative),
+        _ => raw.clone(),
+    };
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // A dangling link reports "not a directory", which is the best we can do and
+    // still preserves the link rather than replacing it with nothing.
+    if target.is_dir() {
+        create_dir_link(&target, destination)
+    } else {
+        create_file_link(&target, destination)
+    }
+}
+
+pub(crate) fn create_dir_link(target: &Path, link: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).with_context(|| {
+            format!("Failed to create symlink {} -> {}", link.display(), target.display())
+        })
+    }
+    #[cfg(windows)]
+    {
+        if std::os::windows::fs::symlink_dir(target, link).is_err() {
+            // No SeCreateSymbolicLinkPrivilege is the common case; a junction
+            // needs none on local NTFS and is equivalent for our purposes.
+            junction::create(target, link).with_context(|| {
+                format!("Failed to create junction {} -> {}", link.display(), target.display())
+            })?;
+        }
+        Ok(())
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        anyhow::bail!("directory links are unsupported on this platform")
+    }
+}
+
+pub(crate) fn create_file_link(target: &Path, link: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).with_context(|| {
+            format!("Failed to create symlink {} -> {}", link.display(), target.display())
+        })
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target, link).with_context(|| {
+            format!("Failed to create symlink {} -> {}", link.display(), target.display())
+        })
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        anyhow::bail!("file links are unsupported on this platform")
+    }
 }
 
 /// Whether two paths resolve to the same directory. Falls back to a lexical
@@ -808,7 +943,7 @@ fn migrate_repo_if_needed(config: &mut RepoPathConfig, target: &Path) -> Migrati
     // (or a rename the OS refuses): copy into the empty target. Because the
     // target is empty, no existing file is ever overwritten.
     if fs::rename(&source, target).is_err() {
-        if let Err(err) = copy_dir_recursive(&source, target) {
+        if let Err(err) = copy_library_tree(&source, target) {
             record_startup_error(format!(
                 "central repo: migration copy from {} to {} failed ({err:#}); keeping data at source",
                 source.display(),
@@ -820,6 +955,9 @@ fn migrate_repo_if_needed(config: &mut RepoPathConfig, target: &Path) -> Migrati
     }
 
     config.pending_migration_from = None;
+    // Tell the caller a move happened, so the agent-side links that pointed into
+    // the old location can be re-pointed once the store is available.
+    record_migration(&source, target);
     MigrationOutcome::Proceed
 }
 
@@ -1206,7 +1344,7 @@ mod tests {
     /// The lock names *this* process's in-flight operation, so it must not be
     /// carried into the destination — that would re-create the poisoned target.
     #[test]
-    fn copy_dir_recursive_leaves_the_lock_file_behind() {
+    fn copy_library_tree_leaves_the_lock_file_behind() {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
         fs::write(src.path().join("keep.md"), b"keep").unwrap();
@@ -1217,12 +1355,126 @@ mod tests {
         .unwrap();
 
         let target = dst.path().join("out");
-        copy_dir_recursive(src.path(), &target).unwrap();
+        copy_library_tree(src.path(), &target).unwrap();
 
         assert!(target.join("keep.md").exists());
         assert!(
             !target.join(crate::core::repo_lock::LOCK_FILE_NAME).exists(),
             "the lock file must not be copied"
+        );
+    }
+
+    /// Links must be recreated, not followed: following a directory link aborted
+    /// the whole copy (and so the relocation), and following a file link turned
+    /// it into a real file.
+    #[cfg(unix)]
+    #[test]
+    fn copy_library_tree_preserves_symlinks() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        fs::create_dir_all(src.path().join("skills/real")).unwrap();
+        fs::write(src.path().join("skills/real/SKILL.md"), b"x").unwrap();
+        // Absolute link to another part of the library.
+        std::os::unix::fs::symlink(
+            src.path().join("skills/real"),
+            src.path().join("skills/link-in"),
+        )
+        .unwrap();
+        // Link to something outside the library.
+        fs::write(outside.path().join("ext.md"), b"e").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("ext.md"),
+            src.path().join("link-out.md"),
+        )
+        .unwrap();
+        // Link to a file inside the library.
+        std::os::unix::fs::symlink(
+            src.path().join("skills/real/SKILL.md"),
+            src.path().join("link-in-file.md"),
+        )
+        .unwrap();
+
+        let target = dst.path().join("out");
+        copy_library_tree(src.path(), &target).unwrap();
+
+        let link_in = target.join("skills/link-in");
+        assert!(
+            fs::symlink_metadata(&link_in).unwrap().file_type().is_symlink(),
+            "an in-library directory link must stay a link"
+        );
+        assert_eq!(fs::read_link(&link_in).unwrap(), target.join("skills/real"));
+        assert_eq!(fs::read_to_string(link_in.join("SKILL.md")).unwrap(), "x");
+        assert_eq!(
+            fs::read_link(target.join("link-out.md")).unwrap(),
+            outside.path().join("ext.md"),
+            "an external link keeps pointing where it did"
+        );
+        assert!(
+            fs::symlink_metadata(target.join("link-in-file.md"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "an in-library file link must stay a link, not become a file"
+        );
+    }
+
+    /// End-to-end: a library containing a directory link used to abort the move,
+    /// which is the retry-forever loop of #449/#469 in a different guise.
+    ///
+    /// The target is pre-seeded with debris so `fs::rename` fails and the copy
+    /// path actually runs — otherwise same-volume relocation renames the tree and
+    /// this test would pass without touching the code it is meant to guard.
+    #[cfg(unix)]
+    #[test]
+    fn migration_of_a_library_containing_a_symlink_completes() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::create_dir_all(src.path().join("skills/real")).unwrap();
+        fs::write(src.path().join("skills/real/SKILL.md"), b"x").unwrap();
+        std::os::unix::fs::symlink(
+            src.path().join("skills/real"),
+            src.path().join("skills/linked"),
+        )
+        .unwrap();
+        // Debris only, so the target stays migratable while still existing.
+        fs::write(
+            dst.path().join(crate::core::repo_lock::LOCK_FILE_NAME),
+            b"pid=1\n",
+        )
+        .unwrap();
+
+        let mut config = config_migrating(src.path(), dst.path());
+        let outcome = migrate_repo_if_needed(&mut config, dst.path());
+
+        assert!(matches!(outcome, MigrationOutcome::Proceed), "got {outcome:?}");
+        assert!(dst.path().join("skills/real/SKILL.md").exists());
+        assert!(fs::symlink_metadata(dst.path().join("skills/linked"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    /// The reverse of the lock-file case: the CLI bridge directory sits in the
+    /// default location on every machine, so migrating *back* to the default
+    /// could never succeed without treating the app's own files as debris.
+    #[test]
+    fn target_holding_only_the_cli_bridge_is_migratable() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join(crate::core::cli_bridge::BRIDGE_BIN_NAME), b"binary").unwrap();
+        fs::write(bin.join(crate::core::cli_bridge::BRIDGE_STAMP_NAME), b"1.40.0").unwrap();
+        assert!(
+            !target_has_user_data(dir.path()).unwrap(),
+            "the bridge directory alone is debris"
+        );
+
+        fs::write(bin.join("notes.txt"), b"mine").unwrap();
+        assert!(
+            target_has_user_data(dir.path()).unwrap(),
+            "a foreign file inside bin must block the move"
         );
     }
 
@@ -1487,7 +1739,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_dir_recursive_copies_read_only_source_files() {
+    fn copy_library_tree_copies_read_only_source_files() {
         // git pack files (.idx/.pack/.rev) are read-only. Copying them into a
         // fresh target must succeed — the #252 brick only happened when
         // OVERWRITING an existing read-only file, which migration now avoids by
@@ -1501,7 +1753,7 @@ mod tests {
         fs::set_permissions(&pack, perms).unwrap();
 
         let target = dst.path().join("out");
-        copy_dir_recursive(src.path(), &target).unwrap();
+        copy_library_tree(src.path(), &target).unwrap();
         assert_eq!(fs::read(target.join("pack.idx")).unwrap(), b"packdata");
     }
 

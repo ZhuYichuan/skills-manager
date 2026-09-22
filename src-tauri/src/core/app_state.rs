@@ -3,7 +3,10 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 
-use super::{central_repo, scenario_service, skill_store::SkillStore, sync_metadata, tool_service};
+use super::{
+    central_repo, relocation_repair, scenario_service, skill_store::SkillStore, sync_metadata,
+    tool_service,
+};
 
 /// Per-stage timings collected during `initialize_store`. The struct is
 /// returned to the caller so the log lines can be emitted once
@@ -69,6 +72,25 @@ fn initialize_store_inner(
     let step = Instant::now();
     let store = Arc::new(SkillStore::new(&db_path).context("Failed to initialize database")?);
     timings.open_store_ms = step.elapsed().as_millis();
+
+    // If this launch moved the library, the deployments that point into it are
+    // now dangling. Repair them here, where the adapters and projects behind the
+    // store are finally available — the migration itself runs before the store
+    // exists. Best-effort: a failure must not stop the app from opening.
+    if let Some((from, to)) = central_repo::take_last_migration() {
+        let step = Instant::now();
+        match relocation_repair::repoint_agent_links(&store, &from, &to) {
+            Ok(0) => {}
+            Ok(repointed) => log::info!(
+                "startup: re-pointed {repointed} agent link(s) after relocating the library to {} in {} ms",
+                to.display(),
+                step.elapsed().as_millis()
+            ),
+            Err(err) => log::warn!(
+                "startup: failed to re-point agent links after relocating the library ({err:#})"
+            ),
+        }
+    }
 
     let step = Instant::now();
     tool_service::migrate_legacy_tool_keys(&store)
