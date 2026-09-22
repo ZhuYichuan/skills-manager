@@ -551,13 +551,22 @@ export function Settings() {
     setSavingCentralRepoPath(true);
     try {
       await api.cancelCentralRepoMigration();
-      setCentralRepoPendingTarget(null);
-      setCentralRepoPathOverride(null);
+      // Re-read rather than assume. Cancelling persists `repo_path` as whatever
+      // the live location is, so "custom vs default" depends on where the user
+      // actually is — assuming `null` here made the hint read "default" after
+      // cancelling a move away from a custom path, and hid the reset button.
+      // That is the same class of lie as #469.
+      const [live, override, pending] = await Promise.all([
+        api.getCentralRepoPath(),
+        api.getCentralRepoPathOverride(),
+        api.getCentralRepoPendingTarget(),
+      ]);
+      setCentralRepoPath(live);
+      setCentralRepoPathInput(live);
+      setCentralRepoPathOverride(override);
+      setCentralRepoPendingTarget(pending);
       setEditingCentralRepoPath(false);
       setCentralRepoPathError(null);
-      const current = await api.getCentralRepoPath();
-      setCentralRepoPath(current);
-      setCentralRepoPathInput(current);
       toast.success(t("settings.repoPathMigrationCancelled"));
     } catch (error) {
       toast.error(getErrorMessage(error, t("common.error")));

@@ -304,6 +304,22 @@ pub(crate) fn set_test_base_dir_override(path: Option<PathBuf>) {
     set_runtime_skills_dir_override(None);
 }
 
+const SKILLS_DIR_NAME: &str = "skills";
+const SCENARIOS_DIR_NAME: &str = "scenarios";
+const CACHE_DIR_NAME: &str = "cache";
+const LOGS_DIR_NAME: &str = "logs";
+
+/// The skeleton directories [`ensure_central_repo`] pre-creates, in one place:
+/// the same list both creates them and recognises them as App-owned Debris. Two
+/// hand-kept lists drift, and a drift here silently re-opens the #449/#469 loop
+/// by making a debris-only target read as user data.
+const SKELETON_DIR_NAMES: [&str; 4] = [
+    SKILLS_DIR_NAME,
+    SCENARIOS_DIR_NAME,
+    CACHE_DIR_NAME,
+    LOGS_DIR_NAME,
+];
+
 pub fn skills_dir() -> PathBuf {
     if let Some(path) = SKILLS_DIR_OVERRIDE
         .get_or_init(|| Mutex::new(None))
@@ -313,7 +329,7 @@ pub fn skills_dir() -> PathBuf {
     {
         return path;
     }
-    base_dir().join("skills")
+    base_dir().join(SKILLS_DIR_NAME)
 }
 
 /// Derive a stable per-skills-root state directory under the user's default base.
@@ -401,15 +417,15 @@ fn sanitize_dir_name(name: &str) -> String {
 }
 
 pub fn scenarios_dir() -> PathBuf {
-    base_dir().join("scenarios")
+    base_dir().join(SCENARIOS_DIR_NAME)
 }
 
 pub fn cache_dir() -> PathBuf {
-    base_dir().join("cache")
+    base_dir().join(CACHE_DIR_NAME)
 }
 
 pub fn logs_dir() -> PathBuf {
-    base_dir().join("logs")
+    base_dir().join(LOGS_DIR_NAME)
 }
 
 pub fn db_path() -> PathBuf {
@@ -561,74 +577,80 @@ pub fn inspect_target(raw: &str) -> Result<TargetInspection> {
         return Ok(TargetInspection::Empty { requested_path });
     }
     if path.join("skills-manager.db").is_file() {
-        return Ok(TargetInspection::ExistingLibrary {
-            requested_path,
-            skill_count: count_library_skills(&path),
-        });
+        // Only offer to adopt a library that actually holds skills. A database
+        // with none is either debris from a failed relocation or a brand-new
+        // empty library; offering it as "use this library" would switch the user
+        // onto an empty one, which reads as data loss. An unreadable database is
+        // likewise not something to hand over to.
+        if let Some(skill_count) = read_library_skill_count(&path) {
+            if skill_count > 0 {
+                return Ok(TargetInspection::ExistingLibrary {
+                    requested_path,
+                    skill_count,
+                });
+            }
+        }
     }
     Ok(TargetInspection::NotEmpty { requested_path })
 }
 
-/// Best-effort skill count for the confirmation prompt. A count of 0 is a
-/// fine fallback: the prompt's purpose is "this is a library", not the exact
-/// number, and we must not fail the inspection over an unreadable database.
-fn count_library_skills(base: &Path) -> usize {
+/// Skill count from an existing library's database, if it can be read at all.
+///
+/// `None` means "cannot tell" — missing, corrupt, or a schema this build does not
+/// understand. Callers must treat that as not-adoptable, never as zero skills.
+fn read_library_skill_count(base: &Path) -> Option<usize> {
     let db = base.join("skills-manager.db");
-    let Ok(conn) = rusqlite::Connection::open_with_flags(
-        &db,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    ) else {
-        return 0;
-    };
-    conn.query_row("SELECT COUNT(*) FROM skills", [], |row| row.get::<_, i64>(0))
-        .unwrap_or(0)
-        .max(0) as usize
+    let conn =
+        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM skills", [], |row| row.get(0))
+        .ok()?;
+    Some(count.max(0) as usize)
 }
 
-/// Names this app creates in a would-be library location before any migration
-/// runs: the write lock, and the skeleton dirs [`ensure_central_repo`] makes.
-/// These are App-owned Debris (ADR 0001) — never user data.
-const APP_OWNED_ENTRIES: [&str; 5] = [
-    crate::core::repo_lock::LOCK_FILE_NAME,
-    "skills",
-    "scenarios",
-    "cache",
-    "logs",
-];
+/// Whether `entry` is something the app itself leaves in a library location
+/// before any migration runs: the write lock file, or one of the bare skeleton
+/// directories.
+///
+/// Every other name counts as content — deliberately including
+/// `skills-manager.db` and `.secret.key`, which this app also creates. Those
+/// carry the library's own state, so treating them as debris risks overwriting
+/// real data, the failure #252 exists to prevent. The cost is that a target
+/// polluted with them is refused rather than healed; the save-time prompt tells
+/// the user to choose an empty folder, which is the safe resolution.
+///
+/// The lock file is exempt as a *file*; a skeleton name is exempt only as a
+/// still-empty *directory*. A regular file that happens to share a skeleton's
+/// name is not ours, and neither is a directory with anything in it.
+fn is_app_owned_debris(entry: &fs::DirEntry) -> Result<bool> {
+    let name = entry.file_name();
+    let Some(name) = name.to_str() else {
+        // An undecodable name is something we did not write.
+        return Ok(false);
+    };
+    let file_type = entry.file_type()?;
+    if name == crate::core::repo_lock::LOCK_FILE_NAME {
+        return Ok(file_type.is_file());
+    }
+    if SKELETON_DIR_NAMES.contains(&name) {
+        return Ok(file_type.is_dir() && fs::read_dir(entry.path())?.next().is_none());
+    }
+    Ok(false)
+}
 
 /// Whether `path` holds anything the user would miss if it were overwritten.
 ///
 /// A location containing only App-owned Debris is still an Empty Target, so it
-/// stays migratable. The whitelist is fixed and each entry must itself be empty
-/// to qualify — deliberately *not* a heuristic, because mistaking real data for
-/// debris would destroy it, which is the failure #252 exists to prevent.
+/// stays migratable. The whitelist is fixed and membership is decided per entry
+/// kind (see [`is_app_owned_debris`]) — deliberately *not* a heuristic, because
+/// mistaking real data for debris would destroy it.
 fn target_has_user_data(path: &Path) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
     }
     for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            // An undecodable name is something we did not write.
-            return Ok(true);
-        };
-        if !APP_OWNED_ENTRIES.contains(&name) {
-            return Ok(true);
-        }
-        let entry_path = entry.path();
-        if entry_path.is_dir() {
-            // A skeleton dir is debris only while it is still empty. Anything
-            // inside it is the user's (or a real library's) and blocks the move.
-            if fs::read_dir(&entry_path)?.next().is_some() {
-                return Ok(true);
-            }
-        } else if entry_path.is_file() {
-            // The lock file carries a pid/operation stamp, so it is non-empty by
-            // nature; its mere existence is what qualifies it as debris.
-            continue;
-        } else {
-            // Symlink or other special file we did not create.
+        if !is_app_owned_debris(&entry?)? {
             return Ok(true);
         }
     }
@@ -1011,16 +1033,45 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(!target_has_user_data(dir.path()).unwrap(), "empty dir");
 
+        // The write lock, and the bare skeleton dirs, are debris.
         fs::write(dir.path().join(crate::core::repo_lock::LOCK_FILE_NAME), b"x").unwrap();
+        for name in SKELETON_DIR_NAMES {
+            fs::create_dir_all(dir.path().join(name)).unwrap();
+        }
         assert!(
             !target_has_user_data(dir.path()).unwrap(),
-            "the lock file alone is debris"
+            "the lock file plus bare skeletons is debris"
         );
 
+        // A populated skeleton dir is not.
+        fs::write(dir.path().join(SKILLS_DIR_NAME).join("mine.md"), b"user").unwrap();
+        assert!(
+            target_has_user_data(dir.path()).unwrap(),
+            "a populated skeleton dir is content"
+        );
+        fs::remove_file(dir.path().join(SKILLS_DIR_NAME).join("mine.md")).unwrap();
+
+        // The database and key carry the library's own state, so neither is
+        // debris: exempting them would risk overwriting a real library (#252).
         fs::write(dir.path().join("skills-manager.db"), b"db").unwrap();
         assert!(
             target_has_user_data(dir.path()).unwrap(),
-            "anything outside the whitelist counts as data"
+            "the database is content, not debris"
+        );
+        fs::remove_file(dir.path().join("skills-manager.db")).unwrap();
+        fs::write(dir.path().join(".secret.key"), b"key").unwrap();
+        assert!(
+            target_has_user_data(dir.path()).unwrap(),
+            "the secret key is content, not debris"
+        );
+
+        // A skeleton *name* that is a plain file is not ours. An earlier revision
+        // exempted any regular file by these names, silently ignoring user data.
+        let lone = tempfile::tempdir().unwrap();
+        fs::write(lone.path().join(CACHE_DIR_NAME), b"a file, not a dir").unwrap();
+        assert!(
+            target_has_user_data(lone.path()).unwrap(),
+            "a file named like a skeleton must not be exempt"
         );
     }
 
@@ -1117,6 +1168,38 @@ mod tests {
             TargetInspection::NotEmpty {
                 requested_path: foreign.path().to_string_lossy().to_string(),
             }
+        );
+
+        // An app database with no skills is either debris from a failed
+        // relocation or a brand-new empty library. Offering it for adoption would
+        // switch the user onto an empty library, which reads as data loss.
+        let empty_library = tempfile::tempdir().unwrap();
+        let empty_db = empty_library.path().join("skills-manager.db");
+        let conn = rusqlite::Connection::open(&empty_db).unwrap();
+        conn.execute_batch("CREATE TABLE skills (id TEXT PRIMARY KEY, name TEXT NOT NULL);")
+            .unwrap();
+        drop(conn);
+        assert_eq!(
+            inspect_target(&empty_library.path().to_string_lossy()).unwrap(),
+            TargetInspection::NotEmpty {
+                requested_path: empty_library.path().to_string_lossy().to_string(),
+            },
+            "an empty library must not be offered for adoption"
+        );
+
+        // A database we cannot read is likewise not something to hand over to.
+        let unreadable = tempfile::tempdir().unwrap();
+        fs::write(
+            unreadable.path().join("skills-manager.db"),
+            b"not a database",
+        )
+        .unwrap();
+        assert_eq!(
+            inspect_target(&unreadable.path().to_string_lossy()).unwrap(),
+            TargetInspection::NotEmpty {
+                requested_path: unreadable.path().to_string_lossy().to_string(),
+            },
+            "an unreadable library must not be offered for adoption"
         );
     }
 
