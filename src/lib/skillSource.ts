@@ -65,8 +65,9 @@ function parseGitRef(ref: string): SkillSourceInfo | null {
 
   path = stripSlashes(path).replace(/\.git$/i, "");
   if (!path) return null;
-  // Branch, subpath and revision never reach this point: callers pass only the
-  // repo reference, so a monorepo's skills stay in one group.
+  // The revision suffix is already gone, and callers pass the repo reference
+  // rather than a directory inside it, so a monorepo's skills stay in one
+  // group.
   path = path.toLowerCase();
   host = host.toLowerCase();
 

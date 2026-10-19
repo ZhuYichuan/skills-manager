@@ -36,7 +36,6 @@ import { toast } from "sonner";
 import { cn } from "../utils";
 import { useApp } from "../context/AppContext";
 import { useSkillViewMode } from "../hooks/useSkillViewMode";
-import { usePersistedBoolean } from "../hooks/usePersistedBoolean";
 import { useMultiSelect } from "../hooks/useMultiSelect";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { TagRenameDialog } from "../components/TagRenameDialog";
@@ -144,8 +143,6 @@ function centralDirName(skill: ManagedSkill) {
   return skill.central_path.split(/[\\/]/).filter(Boolean).pop() || skill.name;
 }
 
-const GROUP_BY_SOURCE_LS_KEY = "skills-manager.mySkillsGroupBySource";
-
 /**
  * One row of the list: either a source header or a skill. Keeping them in one
  * array lets the grouped and ungrouped views share the same render path.
@@ -170,11 +167,10 @@ export function MySkills() {
     projects,
     refreshProjects,
   } = useApp();
-  const [viewMode, setViewMode] = useSkillViewMode();
+  const [viewMode, setViewMode, groupBySource, setGroupBySource] = useSkillViewMode();
   // Grouping is a view preference, so it persists; which groups are open is
   // session state, because a group the user expanded once is not a statement
   // about the next launch.
-  const [groupBySource, setGroupBySource] = usePersistedBoolean(GROUP_BY_SOURCE_LS_KEY, false);
   const [expandedSources, setExpandedSources] = useState<Set<string>>(new Set());
   const [sourceSelection, setSourceSelection] = useState<Set<string>>(new Set());
   const [sourceMenuOpen, setSourceMenuOpen] = useState(false);
