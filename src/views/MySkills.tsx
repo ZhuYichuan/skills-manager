@@ -179,7 +179,9 @@ export function MySkills() {
   const [sourceSelection, setSourceSelection] = useState<Set<string>>(new Set());
   const [sourceMenuOpen, setSourceMenuOpen] = useState(false);
   const [filterMode, setFilterMode] = useState<"all" | "enabled" | "available">("all");
-  const [sourceFilters, setSourceFilters] = useState<Set<string>>(new Set());
+  // Which channel (`source_type`) a skill came through — git, skills.sh, a
+  // site, a local install, an import. Distinct from the Source grouping below.
+  const [channelFilters, setChannelFilters] = useState<Set<string>>(new Set());
   const [tagFilters, setTagFilters] = useState<Set<string>>(new Set());
   const [allTags, setAllTags] = useState<string[]>([]);
   // Tag management from the filter bar (#233): right-click a tag pill to
@@ -281,13 +283,13 @@ export function MySkills() {
   // that leaves one of them on is a lie.
   const hasActiveFilters =
     search.trim() !== "" ||
-    sourceFilters.size > 0 ||
+    channelFilters.size > 0 ||
     tagFilters.size > 0 ||
     sourceSelection.size > 0 ||
     filterMode !== "all";
   const clearFilters = () => {
     setSearch("");
-    setSourceFilters(new Set());
+    setChannelFilters(new Set());
     setTagFilters(new Set());
     setSourceSelection(new Set());
     setFilterMode("all");
@@ -324,7 +326,7 @@ export function MySkills() {
       ]);
       if (!matchesSearch) return false;
 
-      if (sourceFilters.size > 0 && !sourceFilters.has(skill.source_type)) return false;
+      if (channelFilters.size > 0 && !channelFilters.has(skill.source_type)) return false;
 
       if (tagFilters.size > 0) {
         const wantUntagged = tagFilters.has(UNTAGGED_FILTER);
@@ -373,19 +375,22 @@ export function MySkills() {
       sourceCandidates: candidates,
       preSelectionSourceGroups: groups,
     };
-  }, [skills, skillDisplayNames, search, sourceFilters, tagFilters, sourceSelection, filterMode, viewedPreset, presetSkillOrder]);
+  }, [skills, skillDisplayNames, search, channelFilters, tagFilters, sourceSelection, filterMode, viewedPreset, presetSkillOrder]);
 
   // Without a source selection the groups from above already describe
-  // `filtered`; only a narrowing selection forces a rebuild.
-  const sourceGroups = useMemo(
-    () =>
-      groupBySource
-        ? sourceSelection.size === 0
-          ? preSelectionSourceGroups
-          : buildSourceGroups(filtered)
-        : null,
-    [groupBySource, sourceSelection.size, preSelectionSourceGroups, filtered]
-  );
+  // `filtered`; only a narrowing selection forces a rebuild. That rebuild must
+  // keep the labels of the pre-selection groups: path labels are
+  // disambiguated against the other paths, so a group rebuilt from the
+  // survivors alone would read `skills` again instead of `a/skills`.
+  const sourceGroups = useMemo(() => {
+    if (!groupBySource) return null;
+    if (sourceSelection.size === 0) return preSelectionSourceGroups;
+    const labels = new Map(preSelectionSourceGroups.map((group) => [group.key, group.label]));
+    return buildSourceGroups(filtered).map((group) => {
+      const known = labels.get(group.key);
+      return known === undefined ? group : { ...group, label: known };
+    });
+  }, [groupBySource, sourceSelection.size, preSelectionSourceGroups, filtered]);
 
   // A group opens on click, and stays open while the user is searching: a query
   // that matched something inside a collapsed group would otherwise look like
@@ -430,7 +435,7 @@ export function MySkills() {
     isItemActive: (s) => viewedPreset ? s.preset_ids.includes(viewedPreset.id) : true,
     filterSignal: JSON.stringify([
       search,
-      [...sourceFilters].sort(),
+      [...channelFilters].sort(),
       [...tagFilters].sort(),
       [...sourceSelection].sort(),
       filterMode,
@@ -1330,18 +1335,18 @@ export function MySkills() {
       </div>
 
       <div className="flex flex-wrap items-center gap-1 px-1 -mt-2 -mb-3">
-        {(["local", "import", "git", "skillssh"] as const).map((src) => (
+        {(["local", "import", "git", "skillssh"] as const).map((channel) => (
           <button
-            key={src}
-            onClick={() => setSourceFilters(toggleFilter(sourceFilters, src))}
+            key={channel}
+            onClick={() => setChannelFilters(toggleFilter(channelFilters, channel))}
             className={cn(
               "rounded-full px-2.5 py-0.5 text-[12px] font-medium transition-colors",
-              sourceFilters.has(src)
+              channelFilters.has(channel)
                 ? "bg-accent text-white dark:bg-accent dark:text-white"
                 : "bg-surface-hover text-muted hover:text-secondary"
             )}
           >
-            {t(`mySkills.sourceFilter.${src}`)}
+            {t(`mySkills.sourceFilter.${channel}`)}
           </button>
         ))}
         {/* Sources are picked from a menu, not rendered as pills: a library can

@@ -6,8 +6,6 @@ export interface SkillSourceInfo {
   /** What the user sees as the group title, or null when there is no source to name. */
   label: string | null;
   kind: SkillSourceKind;
-  /** The raw field the key was derived from, kept for tooltips and debugging. */
-  raw: string;
 }
 
 export type SkillSourceKind = "repo" | "site" | "path" | "unknown";
@@ -32,13 +30,18 @@ const pathSegments = (key: string) =>
  * git hosts treat `owner/repo` case-insensitively for identity, so
  * `Obra/Superpowers` and `obra/superpowers` are one group.
  */
-function parseGitRef(ref: string, raw: string): SkillSourceInfo | null {
-  const trimmed = ref.trim();
+function parseGitRef(ref: string): SkillSourceInfo | null {
+  // A trailing `#branch` / `?ref=` names a revision inside the repo, not a
+  // different repo, so it is dropped before parsing: one repo, one group.
+  const trimmed = ref.trim().replace(/[?#].*$/, "");
   if (!trimmed) return null;
 
   let host = "";
   let path = "";
   const scp = trimmed.match(/^[^@/\s]+@([^:/\s]+):(.+)$/); // git@github.com:owner/repo
+  // scp without a user: github.com:owner/repo. The host needs a dot, so a
+  // Windows drive path (`C:/x`) cannot be mistaken for one.
+  const hostPath = trimmed.match(/^([\w.-]+\.[\w.-]+):(.+)$/);
   const url = trimmed.match(
     /^(?:https?|ssh|git):\/\/(?:[^@/\s]+@)?([^:/\s]+)(?::\d+)?\/(.+)$/
   );
@@ -50,6 +53,9 @@ function parseGitRef(ref: string, raw: string): SkillSourceInfo | null {
   } else if (url) {
     host = url[1];
     path = url[2];
+  } else if (hostPath) {
+    host = hostPath[1];
+    path = hostPath[2];
   } else if (shorthand) {
     host = "github.com";
     path = `${shorthand[1]}/${shorthand[2]}`;
@@ -65,16 +71,15 @@ function parseGitRef(ref: string, raw: string): SkillSourceInfo | null {
   host = host.toLowerCase();
 
   const label = host === "github.com" ? path : `${host}/${path}`;
-  return { key: `repo:${host}/${path}`, label, kind: "repo", raw };
+  return { key: `repo:${host}/${path}`, label, kind: "repo" };
 }
 
 /**
  * The many call sites differ only in which of the two references wins, so the
- * pair is normalised once: prefer the resolved URL, fall back to the raw one,
- * and keep whichever exists as the reported `raw`.
+ * pair is normalised once: prefer the resolved URL and fall back to the raw one.
  */
 function parseGitRefPair(resolved: string, ref: string): SkillSourceInfo | null {
-  return parseGitRef(resolved || ref, ref || resolved);
+  return parseGitRef(resolved || ref);
 }
 
 /**
@@ -82,7 +87,7 @@ function parseGitRefPair(resolved: string, ref: string): SkillSourceInfo | null 
  * only grouping available — the skills are not a repo, so they group by domain.
  * `source_ref` holds the canonical `https://skills.sh/site/<domain>/<skill>`.
  */
-function parseSiteRef(ref: string, raw: string): SkillSourceInfo | null {
+function parseSiteRef(ref: string): SkillSourceInfo | null {
   const trimmed = ref.trim();
   if (!trimmed) return null;
   const segments = trimmed.replace(/[?#].*$/, "").split("/").filter(Boolean);
@@ -90,11 +95,11 @@ function parseSiteRef(ref: string, raw: string): SkillSourceInfo | null {
   const domain = site >= 0 ? segments[site + 1] : undefined;
   if (domain) {
     const lower = domain.toLowerCase();
-    return { key: `site:${lower}`, label: lower, kind: "site", raw };
+    return { key: `site:${lower}`, label: lower, kind: "site" };
   }
   try {
     const host = new URL(trimmed).host.toLowerCase();
-    return host ? { key: `site:${host}`, label: host, kind: "site", raw } : null;
+    return host ? { key: `site:${host}`, label: host, kind: "site" } : null;
   } catch {
     return null;
   }
@@ -105,11 +110,11 @@ function parseSiteRef(ref: string, raw: string): SkillSourceInfo | null {
  * source. Paths are not case-folded: on a case-sensitive filesystem two paths
  * differing only by case are two different sources.
  */
-function parseLocalRef(ref: string, raw: string): SkillSourceInfo | null {
+function parseLocalRef(ref: string): SkillSourceInfo | null {
   const trimmed = ref.trim().replace(/\\/g, "/").replace(/\/+$/, "");
   if (!trimmed) return null;
   const label = trimmed.split("/").filter(Boolean).pop() || trimmed;
-  return { key: `path:${trimmed}`, label, kind: "path", raw };
+  return { key: `path:${trimmed}`, label, kind: "path" };
 }
 
 /**
@@ -129,22 +134,21 @@ interface SourceContext {
 }
 
 const parseLocalUnlessDetached = ({ skill, ref }: SourceContext) =>
-  isDetached(skill) ? null : parseLocalRef(ref, ref);
+  isDetached(skill) ? null : parseLocalRef(ref);
 
 /**
- * One resolver per `source_type`. Anything not listed here, and any resolver
- * that cannot make sense of the reference, falls through to the generic git
- * parse in `getSkillSourceInfo`.
+ * One resolver per `source_type`. Anything not listed here counts as an
+ * unrecognised channel, and any resolver that cannot make sense of the
+ * reference leaves it unplaced; both land in the `unknown` group.
  */
 const SOURCE_RESOLVERS: Record<string, (ctx: SourceContext) => SkillSourceInfo | null> = {
   git: ({ ref, resolved }) => parseGitRefPair(resolved, ref),
   // `source_ref` is `owner/repo/<skill>`, so the repo URL has to win; the
   // reference is only a fallback when the resolved URL is missing.
   skillssh: ({ ref, resolved }) =>
-    parseGitRef(resolved, ref || resolved) ??
-    (ref ? parseGitRef(ref.split("/").slice(0, -1).join("/"), ref) : null),
-  "well-known": ({ ref, resolved }) =>
-    parseSiteRef(ref, ref) || parseSiteRef(resolved, ref || resolved),
+    parseGitRef(resolved || ref) ??
+    (ref ? parseGitRef(ref.split("/").slice(0, -1).join("/")) : null),
+  "well-known": ({ ref, resolved }) => parseSiteRef(ref) || parseSiteRef(resolved),
   local: parseLocalUnlessDetached,
   import: parseLocalUnlessDetached,
 };
@@ -156,17 +160,10 @@ export function getSkillSourceInfo(skill: ManagedSkill): SkillSourceInfo {
   const info = SOURCE_RESOLVERS[skill.source_type]?.({ skill, ref, resolved });
   if (info) return info;
 
-  if (ref || resolved) {
-    const fallback = parseGitRefPair(resolved, ref);
-    if (fallback) return fallback;
-  }
-
-  return {
-    key: "unknown",
-    label: null,
-    kind: "unknown",
-    raw: ref || resolved,
-  };
+  // No generic git guess here: an unrecognised `source_type` whose
+  // `source_ref` happens to have two segments (`docs/skills`) would otherwise
+  // read as the repository `github.com/docs/skills`.
+  return { key: "unknown", label: null, kind: "unknown" };
 }
 
 /**
