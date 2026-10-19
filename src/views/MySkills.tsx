@@ -36,6 +36,7 @@ import { toast } from "sonner";
 import { cn } from "../utils";
 import { useApp } from "../context/AppContext";
 import { useSkillViewMode } from "../hooks/useSkillViewMode";
+import { usePersistedBoolean } from "../hooks/usePersistedBoolean";
 import { useMultiSelect } from "../hooks/useMultiSelect";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { TagRenameDialog } from "../components/TagRenameDialog";
@@ -146,7 +147,7 @@ function centralDirName(skill: ManagedSkill) {
 const GROUP_BY_SOURCE_LS_KEY = "skills-manager.mySkillsGroupBySource";
 
 /**
- * One row of the list: either a pack header or a skill. Keeping them in one
+ * One row of the list: either a source header or a skill. Keeping them in one
  * array lets the grouped and ungrouped views share the same render path.
  */
 type SkillListRow =
@@ -171,15 +172,9 @@ export function MySkills() {
   } = useApp();
   const [viewMode, setViewMode] = useSkillViewMode();
   // Grouping is a view preference, so it persists; which groups are open is
-  // session state, because a pack the user expanded once is not a statement
+  // session state, because a group the user expanded once is not a statement
   // about the next launch.
-  const [groupBySource, setGroupBySource] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem(GROUP_BY_SOURCE_LS_KEY) === "true";
-    } catch {
-      return false;
-    }
-  });
+  const [groupBySource, setGroupBySource] = usePersistedBoolean(GROUP_BY_SOURCE_LS_KEY, false);
   const [expandedSources, setExpandedSources] = useState<Set<string>>(new Set());
   const [sourceSelection, setSourceSelection] = useState<Set<string>>(new Set());
   const [sourceMenuOpen, setSourceMenuOpen] = useState(false);
@@ -273,14 +268,6 @@ export function MySkills() {
     return () => window.removeEventListener("keydown", onKey);
   }, [tagMenu]);
 
-  useEffect(() => {
-    try {
-      localStorage.setItem(GROUP_BY_SOURCE_LS_KEY, String(groupBySource));
-    } catch {
-      // The toggle still works for the current session.
-    }
-  }, [groupBySource]);
-
   const toggleFilter = (set: Set<string>, value: string): Set<string> => {
     const next = new Set(set);
     if (next.has(value)) next.delete(value);
@@ -325,7 +312,7 @@ export function MySkills() {
     return displayNames;
   }, [skills]);
 
-  const { filtered, sourceCandidates } = useMemo(() => {
+  const { filtered, sourceCandidates, preSelectionSourceGroups } = useMemo(() => {
     const query = normalizeSkillSearch(search);
     const result = skills.filter((skill) => {
       const displayName = skillDisplayNames.get(skill.id) || skill.name;
@@ -370,32 +357,39 @@ export function MySkills() {
       });
     }
 
-    // Candidates come from the result *before* the pack filter is applied.
-    // Otherwise picking a pack would remove the others from the menu the user
-    // needs in order to switch packs.
-    const candidates = buildSourceGroups(result).map(({ key, label, kind, count }) => ({
-      key,
-      label,
-      kind,
-      count,
-    }));
+    // Candidates, and the grouping to reuse below, come from the result
+    // *before* the source selection is applied. Otherwise picking a source
+    // would remove the others from the menu the user needs in order to switch
+    // sources.
+    const groups = buildSourceGroups(result);
+    const candidates = groups.map(({ key, label, count }) => ({ key, label, count }));
 
-    if (sourceSelection.size === 0) return { filtered: result, sourceCandidates: candidates };
+    if (sourceSelection.size === 0) {
+      return { filtered: result, sourceCandidates: candidates, preSelectionSourceGroups: groups };
+    }
 
     return {
       filtered: result.filter((skill) => sourceSelection.has(getSkillSourceInfo(skill).key)),
       sourceCandidates: candidates,
+      preSelectionSourceGroups: groups,
     };
   }, [skills, skillDisplayNames, search, sourceFilters, tagFilters, sourceSelection, filterMode, viewedPreset, presetSkillOrder]);
 
+  // Without a source selection the groups from above already describe
+  // `filtered`; only a narrowing selection forces a rebuild.
   const sourceGroups = useMemo(
-    () => (groupBySource ? buildSourceGroups(filtered) : null),
-    [filtered, groupBySource]
+    () =>
+      groupBySource
+        ? sourceSelection.size === 0
+          ? preSelectionSourceGroups
+          : buildSourceGroups(filtered)
+        : null,
+    [groupBySource, sourceSelection.size, preSelectionSourceGroups, filtered]
   );
 
-  // A pack opens on click, and stays open while the user is searching: a query
-  // that matched something inside a collapsed pack would otherwise look like no
-  // match at all.
+  // A group opens on click, and stays open while the user is searching: a query
+  // that matched something inside a collapsed group would otherwise look like
+  // no match at all.
   const searching = search.trim() !== "";
   const sourceRows = useMemo<SkillListRow[]>(() => {
     if (!sourceGroups) {
@@ -418,11 +412,6 @@ export function MySkills() {
     return rows;
   }, [filtered, sourceGroups, expandedSources, searching]);
 
-  const visibleSkills = useMemo(
-    () => sourceRows.flatMap((row) => (row.kind === "skill" ? [row.skill] : [])),
-    [sourceRows]
-  );
-
   const {
     isMultiSelect, setIsMultiSelect,
     selectedIds,
@@ -433,9 +422,10 @@ export function MySkills() {
     exitMultiSelect,
   } = useMultiSelect({
     items: skills,
-    // Collapsed packs are off screen, so a bulk action must not claim them: the
-    // toolbar counts what the user can see.
-    filtered: visibleSkills,
+    // Collapsing a group is a display choice, so the selection still covers the
+    // whole filtered list: select-all and bulk delete must not be bounded by
+    // which groups happen to be open.
+    filtered,
     getKey: (s) => s.id,
     isItemActive: (s) => viewedPreset ? s.preset_ids.includes(viewedPreset.id) : true,
     filterSignal: JSON.stringify([
@@ -443,8 +433,6 @@ export function MySkills() {
       [...sourceFilters].sort(),
       [...tagFilters].sort(),
       [...sourceSelection].sort(),
-      groupBySource,
-      [...expandedSources].sort(),
       filterMode,
       viewedPreset?.id ?? null,
     ]),
@@ -489,7 +477,7 @@ export function MySkills() {
     [filtered, viewedPreset]
   );
 
-  // Grouped order is pack order, not the preset's order, so dragging would
+  // Grouped order is source order, not the preset's order, so dragging would
   // move a skill to a position the user cannot see.
   const canDrag = !!viewedPreset && !groupBySource;
 
@@ -1311,7 +1299,7 @@ export function MySkills() {
               <List className="h-4 w-4" />
             </button>
             <button
-              onClick={() => setGroupBySource((on) => !on)}
+              onClick={() => setGroupBySource(!groupBySource)}
               aria-pressed={groupBySource}
               className={cn(
                 "rounded-md p-2 transition-colors outline-none",
@@ -1356,7 +1344,7 @@ export function MySkills() {
             {t(`mySkills.sourceFilter.${src}`)}
           </button>
         ))}
-        {/* Packs are picked from a menu, not rendered as pills: a library can
+        {/* Sources are picked from a menu, not rendered as pills: a library can
             hold dozens of repos and directories. */}
         <div className="relative">
           <button
@@ -1541,7 +1529,7 @@ export function MySkills() {
       ) : (
         <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
           <SortableContext
-            items={visibleSkills.map((s) => s.id)}
+            items={filtered.map((s) => s.id)}
             strategy={viewMode === "grid" ? rectSortingStrategy : verticalListSortingStrategy}
           >
           <div
@@ -1566,7 +1554,6 @@ export function MySkills() {
                     "flex items-center gap-1.5 rounded-md px-1 py-1.5 text-left text-[12px] font-semibold text-muted transition-colors hover:bg-surface-hover hover:text-secondary",
                     viewMode === "grid" && "col-span-full"
                   )}
-                  title={row.group.raw}
                 >
                   {row.expanded ? (
                     <ChevronDown className="h-3.5 w-3.5 shrink-0" />

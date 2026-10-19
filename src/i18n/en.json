@@ -404,10 +404,10 @@
       "git": "Git",
       "skillssh": "skills.sh"
     },
-    "groupBySource": "Group by pack",
+    "groupBySource": "Group by source",
     "sourcePicker": {
-      "label": "Pack",
-      "clear": "Clear pack filter",
+      "label": "Source",
+      "clear": "Clear source filter",
       "unknownSource": "Unclassified"
     },
     "tags": {
