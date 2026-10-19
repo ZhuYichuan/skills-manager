@@ -171,7 +171,10 @@ export function MySkills() {
   // Grouping is a view preference, so it persists; which groups are open is
   // session state, because a group the user expanded once is not a statement
   // about the next launch.
-  const [expandedSources, setExpandedSources] = useState<Set<string>>(new Set());
+  // Explicit open/closed choice per source. A source the user never touched
+  // keeps its default: a group of one starts open, since collapsing it by
+  // default would hide the only skill it holds without saving a row.
+  const [groupOpen, setGroupOpen] = useState<Record<string, boolean>>({});
   const [sourceSelection, setSourceSelection] = useState<Set<string>>(new Set());
   const [sourceMenuOpen, setSourceMenuOpen] = useState(false);
   const [filterMode, setFilterMode] = useState<"all" | "enabled" | "available">("all");
@@ -398,20 +401,16 @@ export function MySkills() {
     }
     const rows: SkillListRow[] = [];
     for (const group of sourceGroups) {
-      // A group of one is just a skill; a header for it would add a row without
-      // adding any information.
-      if (group.skills.length === 1) {
-        rows.push({ kind: "skill", skill: group.skills[0] });
-        continue;
-      }
-      const expanded = searching || expandedSources.has(group.key);
+      // Every source gets a header, including one that holds a single skill, so
+      // the grouped view reads the same way whatever the group's size.
+      const expanded = searching || (groupOpen[group.key] ?? group.skills.length === 1);
       rows.push({ kind: "group", group, expanded });
       if (expanded) {
         for (const skill of group.skills) rows.push({ kind: "skill", skill });
       }
     }
     return rows;
-  }, [filtered, sourceGroups, expandedSources, searching]);
+  }, [filtered, sourceGroups, groupOpen, searching]);
 
   const {
     isMultiSelect, setIsMultiSelect,
@@ -1366,7 +1365,9 @@ export function MySkills() {
           {sourceMenuOpen && (
             <>
               <div className="fixed inset-0 z-40" onClick={() => setSourceMenuOpen(false)} />
-              <div className="absolute left-0 top-full z-50 mt-1 max-h-72 w-64 overflow-y-auto rounded-lg border border-border bg-surface py-1 shadow-2xl">
+              {/* overscroll-contain stops a wheel that reaches the end of the
+                  list from scrolling the page underneath it. */}
+              <div className="absolute left-0 top-full z-50 mt-1 max-h-72 w-64 overflow-y-auto overscroll-contain rounded-lg border border-border bg-surface py-1 shadow-2xl">
                 {sourceSelection.size > 0 && (
                   <button
                     onClick={() => setSourceSelection(new Set())}
@@ -1548,7 +1549,7 @@ export function MySkills() {
                 <button
                   key={`group-${row.group.key}`}
                   onClick={() =>
-                    setExpandedSources((prev) => toggleFilter(prev, row.group.key))
+                    setGroupOpen((prev) => ({ ...prev, [row.group.key]: !row.expanded }))
                   }
                   aria-expanded={row.expanded}
                   className={cn(
