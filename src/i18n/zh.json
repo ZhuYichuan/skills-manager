@@ -404,6 +404,12 @@
       "git": "Git",
       "skillssh": "skills.sh"
     },
+    "groupBySource": "按技能包分组",
+    "sourcePicker": {
+      "label": "技能包",
+      "clear": "清除技能包筛选",
+      "unknownSource": "未分类"
+    },
     "tags": {
       "filter": "标签",
       "allTags": "全部标签",
