@@ -870,6 +870,56 @@ pub fn default_tool_adapters() -> Vec<ToolAdapter> {
             recursive_scan: false,
             project_relative_skills_dir: Some(".agents/skills".into()),
         },
+        ToolAdapter {
+            // MiniMax Code is an Electron GUI over a bundled local runtime
+            // (v3.1.4). Its own skill roots are `~/.minimax/skills` at user
+            // level and `<repo>/.minimax/skills` at workspace level — the same
+            // relative path, so no project override is needed.
+            //
+            // One place the two models disagree. The runtime scans
+            // `.minimax/skills` in the directory it opened and in every ancestor
+            // up to the git root; this app writes into each registered project's
+            // own root. They agree when the project root is the repo MiniMax
+            // opens. If the app's project is a *subdirectory* of that repo, the
+            // runtime started at the repo root never walks down into it.
+            //
+            // Two directories next to the native root are deliberately not
+            // scanned. `~/.minimax/.builtin-skills` is re-seeded from the
+            // skills bundled with the app on every start, so anything deployed
+            // there would be managed and then silently overwritten.
+            // `~/.mavis` is the pre-rename data dir; the app keeps it as a
+            // compatibility symlink to `~/.minimax`, so scanning it would list
+            // every skill twice.
+            //
+            // The runtime also reads the shared `~/.agents/skills` root when
+            // `skills.external` is on (the default), and warns when one skill
+            // appears under two roots. It is listed for discovery only, like
+            // `codex`, `github_copilot`, `pi`, `deepseek_harness` and
+            // `gitlab_duo`; deployments still land in `.minimax/skills`. The
+            // two other compatibility roots it reads, `~/.claude/skills` and
+            // `~/.codex/skills`, stay out: those are other agents' private
+            // roots, not a shared one.
+            //
+            // Detection is the data dir, like every other adapter, which means
+            // "the app has been launched once", not "the app is installed".
+            // Windows needs no platform branch: the macOS and Windows builds
+            // share the data-dir code (`os.homedir()/.minimax`, no `%APPDATA%`),
+            // so the Windows root is `%USERPROFILE%\.minimax\skills`.
+            //
+            // Paths verified by reading the bundled runtime's skill-root
+            // resolver in both the macOS and the Windows 3.1.4 builds, not the
+            // documentation.
+            key: "minimax_code".into(),
+            display_name: "MiniMax Code".into(),
+            relative_skills_dir: ".minimax/skills".into(),
+            relative_detect_dir: ".minimax".into(),
+            additional_scan_dirs: vec![".agents/skills".into()],
+            override_skills_dir: None,
+            category: ToolCategory::Coding,
+            is_custom: false,
+            recursive_scan: false,
+            project_relative_skills_dir: None,
+        },
     ]
 }
 
@@ -1050,6 +1100,32 @@ mod tests {
             Some(".omp/skills")
         );
         assert_eq!(adapter.project_relative_skills_dir(), ".omp/skills");
+    }
+
+    #[test]
+    fn minimax_code_deploys_to_its_data_dir_and_discovers_the_shared_root() {
+        let adapter = default_tool_adapters()
+            .into_iter()
+            .find(|adapter| adapter.key == "minimax_code")
+            .expect("minimax_code adapter should exist");
+
+        assert_eq!(adapter.display_name, "MiniMax Code");
+        assert_eq!(adapter.relative_skills_dir, ".minimax/skills");
+        assert_eq!(adapter.relative_detect_dir, ".minimax");
+        assert!(!adapter.recursive_scan);
+        // MiniMax Code reads `<repo>/.minimax/skills` natively — the same
+        // relative path as its user-level root — so no project override is
+        // needed, and the fallback yields exactly that path. (The adapter's
+        // comment above names the one case where this differs from what the
+        // runtime scans.)
+        assert_eq!(adapter.project_relative_skills_dir, None);
+        assert_eq!(adapter.project_relative_skills_dir(), ".minimax/skills");
+        // Shared root: discovery only, never a deploy target.
+        assert!(adapter
+            .additional_scan_dirs
+            .contains(&".agents/skills".to_string()));
+        assert_eq!(adapter.category, ToolCategory::Coding);
+        assert!(!adapter.is_custom);
     }
 
     #[test]
