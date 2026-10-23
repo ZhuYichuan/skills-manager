@@ -87,66 +87,69 @@ export function TagFilterPills({
   };
 
   return (
-    <div className={cn("flex flex-wrap items-start gap-1.5", className)}>
-      <div className="flex flex-wrap items-center gap-1.5">
-        {label && <span className="text-[12px] text-muted">{label}</span>}
-        <button
-          type="button"
-          aria-pressed={selected.size === 0}
-          onClick={onClear}
-          className={cn(
-            "rounded-full px-2.5 py-0.5 text-[12px] font-medium transition-colors",
-            selected.size === 0
-              ? "bg-accent text-white dark:bg-accent dark:text-white"
-              : "bg-surface-hover text-muted hover:text-secondary"
-          )}
-        >
-          {t("mySkills.tags.allTags")}
-        </button>
-        {hasUntagged && (
+    // The fold control sits on its own line *outside* this row: anything that
+    // shares the row with the tags changes the width the fold is measured
+    // against, and a control whose appearance changes that width makes the fold
+    // flicker on and off.
+    <div className={cn("flex w-full flex-col items-start gap-1", className)}>
+      <div className="flex w-full flex-wrap items-center gap-1.5">
+        <div className="flex flex-wrap items-center gap-1.5">
+          {label && <span className="text-[12px] text-muted">{label}</span>}
           <button
             type="button"
-            aria-pressed={selected.has(UNTAGGED_FILTER)}
-            onClick={() => onToggle(UNTAGGED_FILTER)}
-            title={t("mySkills.tags.untagged")}
+            aria-pressed={selected.size === 0}
+            onClick={onClear}
             className={cn(
-              "inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[12px] font-medium transition-colors",
-              selected.has(UNTAGGED_FILTER)
-                ? "bg-surface-active text-primary"
-                : "border border-dashed border-border text-muted hover:text-secondary"
+              "rounded-full px-2.5 py-0.5 text-[12px] font-medium transition-colors",
+              selected.size === 0
+                ? "bg-accent text-white dark:bg-accent dark:text-white"
+                : "bg-surface-hover text-muted hover:text-secondary"
             )}
           >
-            <CircleSlash className="h-3 w-3" />
-            {t("mySkills.tags.untagged")}
+            {t("mySkills.tags.allTags")}
           </button>
-        )}
-      </div>
+          {hasUntagged && (
+            <button
+              type="button"
+              aria-pressed={selected.has(UNTAGGED_FILTER)}
+              onClick={() => onToggle(UNTAGGED_FILTER)}
+              title={t("mySkills.tags.untagged")}
+              className={cn(
+                "inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[12px] font-medium transition-colors",
+                selected.has(UNTAGGED_FILTER)
+                  ? "bg-surface-active text-primary"
+                  : "border border-dashed border-border text-muted hover:text-secondary"
+              )}
+            >
+              <CircleSlash className="h-3 w-3" />
+              {t("mySkills.tags.untagged")}
+              </button>
+            )}
+        </div>
 
-      <div
-        ref={ref}
-        style={
-          folded && height > 0
-            ? {
-                maxHeight: height,
-                WebkitMaskImage: "linear-gradient(to bottom, black 60%, transparent)",
-                maskImage: "linear-gradient(to bottom, black 60%, transparent)",
-              }
-            : undefined
-        }
-        className={cn(
-          "flex min-w-0 flex-1 flex-wrap items-center gap-1.5",
-          folded && "overflow-hidden"
-        )}
-      >
-        {visibleTags.map(chip)}
-        {/* Only the clipped tail is inert. The chips on the two visible rows
-            must stay clickable and reachable; `display: contents` keeps them in
-            the same flex flow as the rest. */}
-        {foldedTags.length > 0 && (
-          <div className="contents" inert={folded}>
-            {foldedTags.map(chip)}
-          </div>
-        )}
+        <div
+          ref={ref}
+          style={
+            folded && height > 0
+              ? {
+                  maxHeight: height,
+                  WebkitMaskImage: "linear-gradient(to bottom, black 60%, transparent)",
+                  maskImage: "linear-gradient(to bottom, black 60%, transparent)",
+                }
+              : undefined
+          }
+          className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5 overflow-hidden"
+        >
+          {visibleTags.map(chip)}
+          {/* Only the clipped tail is inert. The chips on the two visible rows
+              must stay clickable and reachable; `display: contents` keeps them
+              in the same flex flow as the rest. */}
+          {foldedTags.length > 0 && (
+            <div className="contents" inert={folded}>
+              {foldedTags.map(chip)}
+            </div>
+          )}
+        </div>
       </div>
 
       {firstFoldedIndex !== null && (

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 /** How many rows stay visible before the tail folds away. */
 export const FOLDED_ROWS = 2;
@@ -26,52 +26,74 @@ const NOTHING_FOLDED: RowFold = { height: 0, firstFoldedIndex: null };
  * test) is what lets the caller keep the visible part interactive and fold only
  * the tail.
  *
- * A ResizeObserver re-measures on width and zoom changes. `contentKey` covers
- * the other case: a clipped container does not resize as children are added
- * past the fold, so the content itself has to trigger a re-measure.
+ * Two guards keep the measurement from feeding itself. The result is only
+ * written when it actually changed, and a measurement only runs when the
+ * content or the container's width changed — folding changes the container's
+ * height, which fires the ResizeObserver, which would otherwise measure, write
+ * the same numbers back, re-render, and do it again.
  */
 export function useRowOverflow(contentKey: string) {
   const ref = useRef<HTMLDivElement | null>(null);
   const [fold, setFold] = useState<RowFold>(NOTHING_FOLDED);
+  const lastMeasured = useRef({ contentKey: "", width: -1 });
 
-  const measure = useCallback(() => {
-    const node = ref.current;
-    const children = node ? (Array.from(node.children) as HTMLElement[]) : [];
-    if (!node || children.length === 0) {
-      setFold(NOTHING_FOLDED);
-      return;
-    }
+  const measure = useCallback(
+    (force = false) => {
+      const node = ref.current;
+      const children = node ? (Array.from(node.children) as HTMLElement[]) : [];
+      if (!node || children.length === 0) {
+        setFold((prev) => (prev === NOTHING_FOLDED ? prev : NOTHING_FOLDED));
+        return;
+      }
 
-    const rowGap = parseFloat(getComputedStyle(node).rowGap || "0") || 0;
-    const height = heightForRows(children[0].offsetHeight, rowGap, FOLDED_ROWS);
-    // Children flow in order, so the first one whose centre sits below the fold
-    // bounds everything that follows.
-    const top = node.getBoundingClientRect().top;
-    const firstFoldedIndex = children.findIndex((child) => {
-      const rect = child.getBoundingClientRect();
-      return rect.top + rect.height / 2 > top + height;
-    });
+      const width = node.getBoundingClientRect().width;
+      const last = lastMeasured.current;
+      if (!force && last.contentKey === contentKey && Math.abs(last.width - width) < 0.5) {
+        return;
+      }
+      lastMeasured.current = { contentKey, width };
 
-    setFold({
-      height,
-      firstFoldedIndex: firstFoldedIndex === -1 ? null : firstFoldedIndex,
-    });
-  }, []);
+      const rowGap = parseFloat(getComputedStyle(node).rowGap || "0") || 0;
+      const height = heightForRows(children[0].offsetHeight, rowGap, FOLDED_ROWS);
+      // Children flow in order, so the first one whose centre sits below the
+      // fold bounds everything that follows.
+      const top = node.getBoundingClientRect().top;
+      const found = children.findIndex((child) => {
+        const rect = child.getBoundingClientRect();
+        return rect.top + rect.height / 2 > top + height;
+      });
+      const firstFoldedIndex = found === -1 ? null : found;
+
+      setFold((prev) =>
+        prev.height === height && prev.firstFoldedIndex === firstFoldedIndex
+          ? prev
+          : { height, firstFoldedIndex }
+      );
+    },
+    [contentKey]
+  );
+
+  // Before the first paint: a fold applied one frame later is a visible jump
+  // from five rows to two. The measurement above is guarded, so it cannot
+  // cascade — the rule cannot see that far.
+  useLayoutEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    measure(true);
+  }, [measure]);
 
   useEffect(() => {
     const node = ref.current;
     if (!node) return;
 
     if (typeof ResizeObserver === "undefined") {
-      const frame = requestAnimationFrame(measure);
+      const frame = requestAnimationFrame(() => measure());
       return () => cancelAnimationFrame(frame);
     }
 
-    // observe() delivers one entry immediately, which is the first measurement.
-    const observer = new ResizeObserver(measure);
+    const observer = new ResizeObserver(() => measure());
     observer.observe(node);
     return () => observer.disconnect();
-  }, [measure, contentKey]);
+  }, [measure]);
 
   return { ref, ...fold };
 }
