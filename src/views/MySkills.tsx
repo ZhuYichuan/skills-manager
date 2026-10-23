@@ -57,10 +57,10 @@ import type {
 import { getErrorMessage } from "../lib/error";
 import { normalizeSkillSearch, skillSearchMatches } from "../lib/skillSearch";
 import { countHiddenSelected } from "../lib/selectionVisibility";
+import { buildSkillRows, renderedSkillIds, type SkillListRow } from "../lib/skillRows";
 import {
   buildSourceGroups,
   getSkillSourceInfo,
-  type SkillSourceGroup,
 } from "../lib/skillSource";
 import {
   DndContext,
@@ -143,14 +143,6 @@ function getToolDisplayName(toolKey: string, tools: ToolInfo[]) {
 function centralDirName(skill: ManagedSkill) {
   return skill.central_path.split(/[\\/]/).filter(Boolean).pop() || skill.name;
 }
-
-/**
- * One row of the list: either a source header or a skill. Keeping them in one
- * array lets the grouped and ungrouped views share the same render path.
- */
-type SkillListRow =
-  | { kind: "group"; group: SkillSourceGroup; expanded: boolean }
-  | { kind: "skill"; skill: ManagedSkill };
 
 export function MySkills() {
   const { t } = useTranslation();
@@ -277,12 +269,17 @@ export function MySkills() {
     return next;
   };
 
+  // One definition of "a search is in progress": the same normalization that
+  // decides which skills match, so a query of `-` or `_` cannot open every
+  // Source while filtering nothing.
+  const normalizedQuery = normalizeSkillSearch(search);
+
   // A filter can outlive the control that set it (the tag row hides itself once
   // no tag is left), so the empty state carries the way out. `filterMode` is
   // reset too — its control never hides, but a button labelled "clear filters"
   // that leaves one of them on is a lie.
   const hasActiveFilters =
-    search.trim() !== "" ||
+    normalizedQuery !== "" ||
     channelFilters.size > 0 ||
     tagFilters.size > 0 ||
     sourceSelection.size > 0 ||
@@ -315,10 +312,9 @@ export function MySkills() {
   }, [skills]);
 
   const { filtered, sourceCandidates, preSelectionSourceGroups } = useMemo(() => {
-    const query = normalizeSkillSearch(search);
     const result = skills.filter((skill) => {
       const displayName = skillDisplayNames.get(skill.id) || skill.name;
-      const matchesSearch = skillSearchMatches(query, [
+      const matchesSearch = skillSearchMatches(normalizedQuery, [
         skill.name,
         displayName,
         centralDirName(skill),
@@ -375,7 +371,7 @@ export function MySkills() {
       sourceCandidates: candidates,
       preSelectionSourceGroups: groups,
     };
-  }, [skills, skillDisplayNames, search, channelFilters, tagFilters, sourceSelection, filterMode, viewedPreset, presetSkillOrder]);
+  }, [skills, skillDisplayNames, normalizedQuery, channelFilters, tagFilters, sourceSelection, filterMode, viewedPreset, presetSkillOrder]);
 
   // Without a source selection the groups from above already describe
   // `filtered`; only a narrowing selection forces a rebuild. That rebuild must
@@ -392,26 +388,19 @@ export function MySkills() {
     });
   }, [groupBySource, sourceSelection.size, preSelectionSourceGroups, filtered]);
 
-  // A group opens on click, and stays open while the user is searching: a query
-  // that matched something inside a collapsed group would otherwise look like
-  // no match at all.
-  const searching = search.trim() !== "";
-  const sourceRows = useMemo<SkillListRow[]>(() => {
-    if (!sourceGroups) {
-      return filtered.map((skill) => ({ kind: "skill", skill }) as SkillListRow);
-    }
-    const rows: SkillListRow[] = [];
-    for (const group of sourceGroups) {
-      // Every source gets a header, including one that holds a single skill, so
-      // the grouped view reads the same way whatever the group's size.
-      const expanded = searching || (groupOpen[group.key] ?? group.skills.length === 1);
-      rows.push({ kind: "group", group, expanded });
-      if (expanded) {
-        for (const skill of group.skills) rows.push({ kind: "skill", skill });
-      }
-    }
-    return rows;
-  }, [filtered, sourceGroups, groupOpen, searching]);
+  // A search forces every Source open: a query that matched something inside a
+  // collapsed group would otherwise look like no match at all.
+  const searching = normalizedQuery !== "";
+  const sourceRows = useMemo<SkillListRow[]>(
+    () =>
+      buildSkillRows({
+        groups: sourceGroups,
+        skills: filtered,
+        openBySource: groupOpen,
+        searching,
+      }),
+    [sourceGroups, filtered, groupOpen, searching]
+  );
 
   const {
     isMultiSelect, setIsMultiSelect,
@@ -444,13 +433,11 @@ export function MySkills() {
   // after they were picked, and the ones select-all swept up while collapsed.
   // Bulk actions run on `filtered` rather than on the rendered rows, so this is
   // the gap between what the user selected and what they can count.
-  const hiddenSelectedCount = useMemo(() => {
-    if (!isMultiSelect) return 0;
-    const renderedIds = sourceRows.flatMap((row) =>
-      row.kind === "skill" ? [row.skill.id] : []
-    );
-    return countHiddenSelected(selectedIds, renderedIds);
-  }, [isMultiSelect, sourceRows, selectedIds]);
+  const hiddenSelectedCount = useMemo(
+    () =>
+      isMultiSelect ? countHiddenSelected(selectedIds, renderedSkillIds(sourceRows)) : 0,
+    [isMultiSelect, sourceRows, selectedIds]
+  );
 
   const selectedSkill = useMemo(
     () => skills.find((skill) => skill.id === detailSkillId) || null,
@@ -1583,7 +1570,7 @@ export function MySkills() {
               // A search forces every source open, so folding is not available
               // and a toggle would be a button that cannot do anything. It is a
               // plain row until the query is cleared.
-              if (searching) {
+              if (!row.collapsible) {
                 return (
                   <div key={`group-${row.group.key}`} className={layout}>
                     {header}
