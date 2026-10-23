@@ -1562,18 +1562,8 @@ export function MySkills() {
           {sourceRows.map((row) => {
             if (row.kind === "group") {
               const label = row.group.label || t("mySkills.sourcePicker.unknownSource");
-              return (
-                <button
-                  key={`group-${row.group.key}`}
-                  onClick={() =>
-                    setGroupOpen((prev) => ({ ...prev, [row.group.key]: !row.expanded }))
-                  }
-                  aria-expanded={row.expanded}
-                  className={cn(
-                    "flex items-center gap-1.5 rounded-md px-1 py-1.5 text-left text-[12px] font-semibold text-muted transition-colors hover:bg-surface-hover hover:text-secondary",
-                    viewMode === "grid" && "col-span-full"
-                  )}
-                >
+              const header = (
+                <>
                   {row.expanded ? (
                     <ChevronDown className="h-3.5 w-3.5 shrink-0" />
                   ) : (
@@ -1583,6 +1573,34 @@ export function MySkills() {
                   <span className="shrink-0 text-[11px] font-medium text-faint">
                     {row.group.count}
                   </span>
+                </>
+              );
+              const layout = cn(
+                "flex items-center gap-1.5 rounded-md px-1 py-1.5 text-left text-[12px] font-semibold text-muted",
+                viewMode === "grid" && "col-span-full"
+              );
+
+              // A search forces every source open, so folding is not available
+              // and a toggle would be a button that cannot do anything. It is a
+              // plain row until the query is cleared.
+              if (searching) {
+                return (
+                  <div key={`group-${row.group.key}`} className={layout}>
+                    {header}
+                  </div>
+                );
+              }
+
+              return (
+                <button
+                  key={`group-${row.group.key}`}
+                  onClick={() =>
+                    setGroupOpen((prev) => ({ ...prev, [row.group.key]: !row.expanded }))
+                  }
+                  aria-expanded={row.expanded}
+                  className={cn(layout, "transition-colors hover:bg-surface-hover hover:text-secondary")}
+                >
+                  {header}
                 </button>
               );
             }
