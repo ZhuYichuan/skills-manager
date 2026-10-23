@@ -92,7 +92,10 @@ export function TagFilterPills({
     // against, and a control whose appearance changes that width makes the fold
     // flicker on and off.
     <div className={cn("flex w-full flex-col items-start gap-1", className)}>
-      <div className="flex w-full flex-wrap items-center gap-1.5">
+      {/* items-start, not items-center: the caption and the two fixed pills are
+          one row tall, and centring them against a two-row tag block would park
+          them between the rows instead of on the first one. */}
+      <div className="flex w-full flex-wrap items-start gap-1.5">
         <div className="flex flex-wrap items-center gap-1.5">
           {label && <span className="text-[12px] text-muted">{label}</span>}
           <button
