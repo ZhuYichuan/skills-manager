@@ -6,7 +6,6 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronRight,
-  CircleSlash,
   Loader2,
   Search,
   X,
@@ -23,14 +22,14 @@ import {
   type ProjectPickerContext,
 } from "../lib/skillPickerStatus";
 import {
-  getTagActiveColor,
-  getTagColor,
   UNTAGGED_FILTER,
 } from "../lib/skillTags";
 import { AgentIcon } from "./AgentIcon";
 import { SkillPickerRow } from "./SkillPickerRow";
+import { SourceChannelPills } from "./SourceChannelPills";
+import { TagFilterPills } from "./TagFilterPills";
+import { channelsForSkills, isKnownChannel } from "../lib/skillChannels";
 
-const SOURCE_PRIORITY = ["local", "import", "git", "skillssh"];
 const VISIBLE_TARGET_ICON_LIMIT = 5;
 
 export interface GlobalSheetTarget {
@@ -159,21 +158,11 @@ function AddSkillsSheetBody({ onClose, target, managedSkills, onInstalled }: Pro
     return Array.from(tags).sort((a, b) => a.localeCompare(b));
   }, [managedSkills]);
 
-  const sourceTypes = useMemo(() => {
-    const present = new Set(managedSkills.map((s) => s.source_type).filter(Boolean));
-    return [
-      ...SOURCE_PRIORITY.filter((s) => present.has(s)),
-      ...Array.from(present).filter((s) => !SOURCE_PRIORITY.includes(s)).sort(),
-    ];
-  }, [managedSkills]);
+  // Same list, same order as My Skills: the shared pills own both.
+  const channels = useMemo(() => channelsForSkills(managedSkills), [managedSkills]);
 
   const sourceLabel = useCallback(
-    (source: string) => {
-      if (SOURCE_PRIORITY.includes(source)) {
-        return t(`mySkills.sourceFilter.${source}`);
-      }
-      return source;
-    },
+    (source: string) => (isKnownChannel(source) ? t(`mySkills.sourceFilter.${source}`) : source),
     [t],
   );
 
@@ -597,74 +586,23 @@ function AddSkillsSheetBody({ onClose, target, managedSkills, onInstalled }: Pro
           </div>
 
           {(allTags.length > 0 || skillsHaveUntagged) && (
-            <div className="mt-2 flex flex-wrap items-center gap-1.5">
-              <span className="text-[12px] text-muted">{t("mySkills.tags.filter")}</span>
-              <button
-                onClick={() => setTagFilters(new Set())}
-                className={cn(
-                  "rounded-full px-2.5 py-0.5 text-[12px] font-medium transition-colors",
-                  tagFilters.size === 0
-                    ? "bg-accent text-white dark:bg-accent dark:text-white"
-                    : "bg-surface-hover text-muted hover:text-secondary",
-                )}
-              >
-                {t("mySkills.tags.allTags")}
-              </button>
-              {skillsHaveUntagged && (
-                <button
-                  onClick={() => toggleTagFilter(UNTAGGED_FILTER)}
-                  className={cn(
-                    "inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[12px] font-medium transition-colors",
-                    tagFilters.has(UNTAGGED_FILTER)
-                      ? "bg-surface-active text-primary"
-                      : "border border-dashed border-border text-muted hover:text-secondary",
-                  )}
-                  title={t("mySkills.tags.untagged")}
-                >
-                  <CircleSlash className="h-3 w-3" />
-                  {t("mySkills.tags.untagged")}
-                </button>
-              )}
-              {allTags.map((tag) => {
-                const active = tagFilters.has(tag);
-                return (
-                  <button
-                    key={tag}
-                    onClick={() => toggleTagFilter(tag)}
-                    className={cn(
-                      "rounded-full px-2.5 py-0.5 text-[12px] font-medium transition-colors",
-                      active ? getTagActiveColor(tag, allTags) : getTagColor(tag, allTags),
-                    )}
-                  >
-                    {tag}
-                  </button>
-                );
-              })}
-            </div>
+            <TagFilterPills
+              tags={allTags}
+              selected={tagFilters}
+              onToggle={toggleTagFilter}
+              onClear={() => setTagFilters(new Set())}
+              hasUntagged={skillsHaveUntagged}
+              label={t("mySkills.tags.filter")}
+              className="mt-2"
+            />
           )}
 
-          {sourceTypes.length > 1 && (
-            <div className="mt-2 flex flex-wrap items-center gap-1.5">
-              <span className="text-[12px] text-muted">{t("mySkills.sourceType")}</span>
-              {sourceTypes.map((source) => {
-                const active = sourceFilters.has(source);
-                return (
-                  <button
-                    key={source}
-                    onClick={() => toggleSourceFilter(source)}
-                    className={cn(
-                      "rounded-full px-2.5 py-0.5 text-[12px] font-medium transition-colors",
-                      active
-                        ? "bg-accent text-white dark:bg-accent dark:text-white"
-                        : "bg-surface-hover text-muted hover:text-secondary",
-                    )}
-                  >
-                    {sourceLabel(source)}
-                  </button>
-                );
-              })}
-            </div>
-          )}
+          <SourceChannelPills
+            channels={channels}
+            selected={sourceFilters}
+            onToggle={toggleSourceFilter}
+            className="mt-2"
+          />
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto scrollbar-hide">
