@@ -839,6 +839,7 @@
     "selectAllSkills": "Select all skills",
     "deselectAllSkills": "Deselect all skills",
     "selectedCount": "{{count}} selected",
+    "hiddenByFilters": "({{count}} hidden by the current filter)",
     "shiftHint": "Shift + click to select a range",
     "clearTargets": "Clear",
     "searchPlaceholder": "Search the library…",

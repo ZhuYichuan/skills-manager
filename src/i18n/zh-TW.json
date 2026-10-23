@@ -831,6 +831,7 @@
     "selectAllSkills": "全選技能",
     "deselectAllSkills": "取消全選",
     "selectedCount": "已選 {{count}} 個",
+    "hiddenByFilters": "（其中 {{count}} 個被目前篩選隱藏）",
     "shiftHint": "按住 Shift 點擊可批量選擇",
     "clearTargets": "清空",
     "searchPlaceholder": "搜尋技能庫…",

@@ -839,6 +839,7 @@
     "selectAllSkills": "全选技能",
     "deselectAllSkills": "取消全选",
     "selectedCount": "已选 {{count}} 个",
+    "hiddenByFilters": "（其中 {{count}} 个被当前筛选隐藏）",
     "shiftHint": "按住 Shift 点击可批量选择",
     "clearTargets": "清空",
     "searchPlaceholder": "搜索技能库…",

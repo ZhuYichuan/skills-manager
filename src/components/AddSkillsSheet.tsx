@@ -27,8 +27,10 @@ import {
 import { AgentIcon } from "./AgentIcon";
 import { SkillPickerRow } from "./SkillPickerRow";
 import { ChannelPills } from "./ChannelPills";
+import { SourcePicker } from "./SourcePicker";
 import { TagFilterPills } from "./TagFilterPills";
 import { channelLabel, channelsForSkills } from "../lib/skillChannels";
+import { getSkillSourceInfo, sourceCandidates } from "../lib/skillSource";
 
 const VISIBLE_TARGET_ICON_LIMIT = 5;
 
@@ -72,7 +74,10 @@ function AddSkillsSheetBody({ onClose, target, managedSkills, onInstalled }: Pro
   const { t } = useTranslation();
   const [search, setSearch] = useState("");
   const [tagFilters, setTagFilters] = useState<Set<string>>(new Set());
-  const [sourceFilters, setSourceFilters] = useState<Set<string>>(new Set());
+  // Channels (`source_type`) and Sources (the upstream a skill came from) are
+  // different filters; My Skills names them the same way.
+  const [channelFilters, setChannelFilters] = useState<Set<string>>(new Set());
+  const [sourceSelection, setSourceSelection] = useState<Set<string>>(new Set());
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [anchorId, setAnchorId] = useState<string | null>(null);
   const [installing, setInstalling] = useState(false);
@@ -169,7 +174,7 @@ function AddSkillsSheetBody({ onClose, target, managedSkills, onInstalled }: Pro
     const tagSelected = tagFilters.size > 0;
     return managedSkills.filter((skill) => {
       if (!skillSearchMatches(q, [skill.name, skill.description])) return false;
-      if (sourceFilters.size > 0 && !sourceFilters.has(skill.source_type)) return false;
+      if (channelFilters.size > 0 && !channelFilters.has(skill.source_type)) return false;
       if (tagSelected) {
         const matchUntagged = hasUntagged && skill.tags.length === 0;
         const matchTag = skill.tags.some((tag) => tagFilters.has(tag));
@@ -177,18 +182,40 @@ function AddSkillsSheetBody({ onClose, target, managedSkills, onInstalled }: Pro
       }
       return true;
     });
-  }, [managedSkills, search, sourceFilters, tagFilters]);
+  }, [managedSkills, search, channelFilters, tagFilters]);
+
+  // Candidates before the Source filter is applied, or picking one Source would
+  // remove the others from the menu needed to switch. Same rule as My Skills.
+  const sourceOptions = useMemo(() => sourceCandidates(filtered), [filtered]);
+  const visible = useMemo(
+    () =>
+      sourceSelection.size === 0
+        ? filtered
+        : filtered.filter((skill) => sourceSelection.has(getSkillSourceInfo(skill).key)),
+    [filtered, sourceSelection]
+  );
+
+  // Selected skills the filters have hidden. They are still installed, so the
+  // footer has to say so rather than let the count disagree with the rows.
+  const hiddenSelectedCount = useMemo(() => {
+    const visibleIds = new Set(visible.map((skill) => skill.id));
+    let hidden = 0;
+    for (const id of selectedIds) {
+      if (!visibleIds.has(id)) hidden += 1;
+    }
+    return hidden;
+  }, [selectedIds, visible]);
 
   // Sort: available first, then installed/conflict/unavailable (greyed out at bottom)
   const ordered = useMemo(() => {
     const statusOrder = { available: 0, conflict: 1, installed: 2, unavailable: 3 } as const;
-    return [...filtered].sort((a, b) => {
+    return [...visible].sort((a, b) => {
       const sa = classifySkill(a, ctx);
       const sb = classifySkill(b, ctx);
       if (sa !== sb) return statusOrder[sa] - statusOrder[sb];
       return a.name.localeCompare(b.name);
     });
-  }, [filtered, ctx]);
+  }, [visible, ctx]);
 
   // IDs of skills the user can add (status "available") in the current filtered view.
   const availableIds = useMemo(
@@ -254,11 +281,11 @@ function AddSkillsSheetBody({ onClose, target, managedSkills, onInstalled }: Pro
     setAnchorId(skill.id);
   };
 
-  const toggleSourceFilter = (source: string) => {
-    setSourceFilters((prev) => {
+  const toggleChannelFilter = (channel: string) => {
+    setChannelFilters((prev) => {
       const next = new Set(prev);
-      if (next.has(source)) next.delete(source);
-      else next.add(source);
+      if (next.has(channel)) next.delete(channel);
+      else next.add(channel);
       return next;
     });
   };
@@ -584,12 +611,19 @@ function AddSkillsSheetBody({ onClose, target, managedSkills, onInstalled }: Pro
 
           {/* Channels before tags, as My Skills lays them out: the two rows
               never reorder between the page and the drawer. */}
-          <ChannelPills
-            channels={channels}
-            selected={sourceFilters}
-            onToggle={toggleSourceFilter}
-            className="mt-2"
-          />
+          <div className="mt-2 flex flex-wrap items-center gap-1.5">
+            <ChannelPills
+              channels={channels}
+              selected={channelFilters}
+              onToggle={toggleChannelFilter}
+              className="gap-1.5"
+            />
+            <SourcePicker
+              candidates={sourceOptions}
+              selected={sourceSelection}
+              onChange={setSourceSelection}
+            />
+          </div>
 
           {(allTags.length > 0 || skillsHaveUntagged) && (
             <TagFilterPills
@@ -637,6 +671,8 @@ function AddSkillsSheetBody({ onClose, target, managedSkills, onInstalled }: Pro
               {selectableSelected.length > 0
                 ? t("addFromLibrary.selectedCount", { count: selectableSelected.length })
                 : t("addFromLibrary.shiftHint")}
+              {hiddenSelectedCount > 0 &&
+                ` ${t("addFromLibrary.hiddenByFilters", { count: hiddenSelectedCount })}`}
             </span>
             <button
               type="button"
