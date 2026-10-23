@@ -28,9 +28,6 @@ interface Props {
   className?: string;
 }
 
-/** How many rows of tags stay visible before the rest fold away. */
-const VISIBLE_ROWS = 2;
-
 /**
  * The tag half of a skill filter bar. My Skills and the drawer that adds skills
  * to an Agent or a project render this, so a tag looks and behaves the same in
@@ -52,15 +49,42 @@ export function TagFilterPills({
 }: Props) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
-  // A clipped container does not resize when tags are added past the fold, so
-  // the content itself is the trigger here.
-  const { ref, overflows, foldedHeight } = useRowOverflow(VISIBLE_ROWS, tags.join("\u0000"));
-  const folded = overflows && !expanded;
+  const { ref, height, firstFoldedIndex } = useRowOverflow(tags.join("\u0000"));
+  const folded = firstFoldedIndex !== null && !expanded;
+  const visibleTags = firstFoldedIndex === null ? tags : tags.slice(0, firstFoldedIndex);
+  const foldedTags = firstFoldedIndex === null ? [] : tags.slice(firstFoldedIndex);
   // Tags the fold is hiding that still filter the list — the control has to
   // admit they exist, or the user has no way to find them again.
   const selectedInFoldedRows = folded
-    ? tags.filter((tag) => selected.has(tag)).length
+    ? foldedTags.filter((tag) => selected.has(tag)).length
     : 0;
+
+  const chip = (tag: string) => {
+    const active = selected.has(tag);
+    return (
+      <button
+        key={tag}
+        type="button"
+        aria-pressed={active}
+        onClick={() => onToggle(tag)}
+        onContextMenu={
+          onTagContextMenu
+            ? (event) => {
+                event.preventDefault();
+                onTagContextMenu(tag, event);
+              }
+            : undefined
+        }
+        title={onTagContextMenu ? t("mySkills.tags.manageHint") : undefined}
+        className={cn(
+          "rounded-full px-2.5 py-0.5 text-[12px] font-medium transition-colors",
+          active ? getTagActiveColor(tag, tags) : getTagColor(tag, tags)
+        )}
+      >
+        {tag}
+      </button>
+    );
+  };
 
   return (
     <div className={cn("flex flex-wrap items-start gap-1.5", className)}>
@@ -100,14 +124,10 @@ export function TagFilterPills({
 
       <div
         ref={ref}
-        // Folding is a visual cut, not a removal: without this the clipped tags
-        // stay in the tab order and keyboard users land on buttons they cannot
-        // see.
-        inert={folded}
         style={
-          folded && foldedHeight !== null
+          folded && height > 0
             ? {
-                maxHeight: foldedHeight,
+                maxHeight: height,
                 WebkitMaskImage: "linear-gradient(to bottom, black 60%, transparent)",
                 maskImage: "linear-gradient(to bottom, black 60%, transparent)",
               }
@@ -118,40 +138,23 @@ export function TagFilterPills({
           folded && "overflow-hidden"
         )}
       >
-        {tags.map((tag) => {
-          const active = selected.has(tag);
-          return (
-            <button
-              key={tag}
-              type="button"
-              aria-pressed={active}
-              onClick={() => onToggle(tag)}
-              onContextMenu={
-                onTagContextMenu
-                  ? (event) => {
-                      event.preventDefault();
-                      onTagContextMenu(tag, event);
-                    }
-                  : undefined
-              }
-              title={onTagContextMenu ? t("mySkills.tags.manageHint") : undefined}
-              className={cn(
-                "rounded-full px-2.5 py-0.5 text-[12px] font-medium transition-colors",
-                active ? getTagActiveColor(tag, tags) : getTagColor(tag, tags)
-              )}
-            >
-              {tag}
-            </button>
-          );
-        })}
+        {visibleTags.map(chip)}
+        {/* Only the clipped tail is inert. The chips on the two visible rows
+            must stay clickable and reachable; `display: contents` keeps them in
+            the same flex flow as the rest. */}
+        {foldedTags.length > 0 && (
+          <div className="contents" inert={folded}>
+            {foldedTags.map(chip)}
+          </div>
+        )}
       </div>
 
-      {overflows && (
+      {firstFoldedIndex !== null && (
         <button
           type="button"
           aria-expanded={expanded}
           onClick={() => setExpanded((wasExpanded) => !wasExpanded)}
-          className="rounded-md px-1 py-0.5 text-[12px] font-medium text-muted transition-colors hover:text-secondary"
+          className="w-full rounded-md px-1 py-0.5 text-left text-[12px] font-medium text-muted transition-colors hover:text-secondary"
         >
           {expanded
             ? t("mySkills.tags.showFewer")

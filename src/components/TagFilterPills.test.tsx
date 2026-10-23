@@ -6,12 +6,12 @@ import { cleanup, mount, pills } from "../test-utils/mount";
 
 // jsdom reports every height as 0, so the fold decision — a geometric one —
 // cannot be measured here. It is mocked; the presentation it drives is not.
-const overflow = vi.hoisted(() => ({ overflows: false, foldedHeight: 40 }));
+const overflow = vi.hoisted(() => ({ firstFoldedIndex: null as number | null, height: 40 }));
 vi.mock("../hooks/useRowOverflow", () => ({
   useRowOverflow: () => ({
     ref: { current: null },
-    overflows: overflow.overflows,
-    foldedHeight: overflow.foldedHeight,
+    height: overflow.height,
+    firstFoldedIndex: overflow.firstFoldedIndex,
   }),
 }));
 
@@ -22,9 +22,14 @@ vi.mock("react-i18next", () => ({
 const { TagFilterPills } = await import("./TagFilterPills");
 
 beforeEach(() => {
-  overflow.overflows = false;
-  overflow.foldedHeight = 40;
+  overflow.firstFoldedIndex = null;
+  overflow.height = 40;
 });
+
+/** Fold everything from `index` on. */
+const foldFrom = (index: number) => {
+  overflow.firstFoldedIndex = index;
+};
 
 afterEach(cleanup);
 
@@ -45,7 +50,9 @@ function render(props: Partial<Parameters<typeof TagFilterPills>[0]> = {}) {
   const foldControl = () =>
     buttons().find((button) => button.getAttribute("aria-expanded") !== null);
   const folded = () => container.querySelector("[inert]") as HTMLElement | null;
-  return { container, buttons, foldControl, folded };
+  const chipNamed = (name: string) =>
+    buttons().find((button) => button.textContent === name) as HTMLButtonElement;
+  return { container, buttons, foldControl, folded, chipNamed };
 }
 
 describe("TagFilterPills", () => {
@@ -111,19 +118,23 @@ describe("TagFilterPills", () => {
   });
 
   it("folds the tail behind a control that says how many there are", () => {
-    overflow.overflows = true;
+    foldFrom(2);
     const shown = render();
     expect(shown.foldControl()?.textContent).toBe("mySkills.tags.showAll");
     expect(shown.foldControl()?.getAttribute("aria-expanded")).toBe("false");
   });
 
-  it("keeps the folded tags out of the tab order while folded", () => {
-    overflow.overflows = true;
-    expect(render().folded()).not.toBeNull();
+  it("folds only the clipped tail, leaving the visible chips usable", () => {
+    foldFrom(2);
+    const shown = render();
+    // alpha and beta are on the visible rows; gamma is the whole folded tail.
+    expect(shown.folded()?.contains(shown.chipNamed("gamma"))).toBe(true);
+    expect(shown.folded()?.contains(shown.chipNamed("alpha"))).toBe(false);
+    expect(shown.folded()?.contains(shown.chipNamed("beta"))).toBe(false);
   });
 
   it("expands on click and offers to fold again", () => {
-    overflow.overflows = true;
+    foldFrom(2);
     const shown = render();
     act(() => shown.foldControl()?.click());
     expect(shown.foldControl()?.getAttribute("aria-expanded")).toBe("true");
@@ -131,24 +142,31 @@ describe("TagFilterPills", () => {
     expect(shown.folded()).toBeNull();
   });
 
-  it("says how many folded tags are still filtering the list", () => {
-    // A filter the user cannot see still narrows the list; the control admits it.
-    overflow.overflows = true;
-    const shown = render({ selected: new Set(["beta", "gamma"]) });
+  it("counts only the folded tags that are selected", () => {
+    // alpha is selected but visible; gamma is selected and folded. One, not two.
+    foldFrom(2);
+    const shown = render({ selected: new Set(["alpha", "gamma"]) });
     expect(shown.foldControl()?.textContent).toBe(
       "mySkills.tags.showAll mySkills.tags.foldedSelected"
     );
+    expect(shown.foldControl()?.textContent).not.toContain("two");
+  });
+
+  it("says nothing about selection when the folded tags are unselected", () => {
+    foldFrom(2);
+    const shown = render({ selected: new Set(["alpha"]) });
+    expect(shown.foldControl()?.textContent).toBe("mySkills.tags.showAll");
   });
 
   it("drops that note once expanded, since the tags are visible again", () => {
-    overflow.overflows = true;
-    const shown = render({ selected: new Set(["beta"]) });
+    foldFrom(2);
+    const shown = render({ selected: new Set(["gamma"]) });
     act(() => shown.foldControl()?.click());
     expect(shown.foldControl()?.textContent).toBe("mySkills.tags.showFewer");
   });
 
   it("never folds the all-tags or untagged pills", () => {
-    overflow.overflows = true;
+    foldFrom(2);
     const { container } = render();
     const folded = container.querySelector("[inert]") as HTMLElement;
     const foldedText = folded.textContent ?? "";
