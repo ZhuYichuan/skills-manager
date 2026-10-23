@@ -56,6 +56,7 @@ import type {
 } from "../lib/tauri";
 import { getErrorMessage } from "../lib/error";
 import { normalizeSkillSearch, skillSearchMatches } from "../lib/skillSearch";
+import { countHiddenSelected } from "../lib/selectionVisibility";
 import {
   buildSourceGroups,
   getSkillSourceInfo,
@@ -438,6 +439,18 @@ export function MySkills() {
     ]),
     escapeEnabled: !batchTagDialogOpen && !batchSyncDialogOpen && !batchDeleteConfirm,
   });
+
+  // Selected skills with no row on screen: the skills of a Source collapsed
+  // after they were picked, and the ones select-all swept up while collapsed.
+  // Bulk actions run on `filtered` rather than on the rendered rows, so this is
+  // the gap between what the user selected and what they can count.
+  const hiddenSelectedCount = useMemo(() => {
+    if (!isMultiSelect) return 0;
+    const renderedIds = sourceRows.flatMap((row) =>
+      row.kind === "skill" ? [row.skill.id] : []
+    );
+    return countHiddenSelected(selectedIds, renderedIds);
+  }, [isMultiSelect, sourceRows, selectedIds]);
 
   const selectedSkill = useMemo(
     () => skills.find((skill) => skill.id === detailSkillId) || null,
@@ -1505,6 +1518,10 @@ export function MySkills() {
           labels={{
             hint: t("mySkills.selectHint"),
             selected: t("mySkills.selectedCount", { count: selectedIds.size }),
+            hiddenSelected:
+              hiddenSelectedCount > 0
+                ? t("mySkills.hiddenInCollapsedSources", { count: hiddenSelectedCount })
+                : undefined,
             selectAll: t("mySkills.selectAll"),
             deselectAll: t("mySkills.deselectAll"),
             cancel: t("common.cancel"),
@@ -2092,7 +2109,14 @@ export function MySkills() {
       />
       <ConfirmDialog
         open={batchDeleteConfirm}
-        message={t("mySkills.batchDeleteConfirm", { count: selectedIds.size })}
+        message={
+          hiddenSelectedCount > 0
+            ? `${t("mySkills.batchDeleteConfirm", { count: selectedIds.size })} ${t(
+                "mySkills.batchDeleteHiddenInCollapsed",
+                { count: hiddenSelectedCount }
+              )}`
+            : t("mySkills.batchDeleteConfirm", { count: selectedIds.size })
+        }
         onClose={() => setBatchDeleteConfirm(false)}
         onConfirm={handleBatchDelete}
       />
