@@ -1,6 +1,6 @@
 import { useTranslation } from "react-i18next";
 import { cn } from "../utils";
-import { isKnownChannel } from "../lib/skillChannels";
+import { channelLabel } from "../lib/skillChannels";
 
 interface Props {
   /** Channels to render, already in display order — see channelsForSkills. */
@@ -17,7 +17,7 @@ interface Props {
  * name (shown as the raw `source_type` rather than dropped, which would look
  * like the filter cannot reach those skills at all).
  */
-export function SourceChannelPills({ channels, selected, onToggle, className }: Props) {
+export function ChannelPills({ channels, selected, onToggle, className }: Props) {
   const { t } = useTranslation();
 
   return (
@@ -37,7 +37,7 @@ export function SourceChannelPills({ channels, selected, onToggle, className }: 
                 : "bg-surface-hover text-muted hover:text-secondary"
             )}
           >
-            {isKnownChannel(channel) ? t(`mySkills.sourceFilter.${channel}`) : channel}
+            {channelLabel(t, channel)}
           </button>
         );
       })}

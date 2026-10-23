@@ -56,7 +56,7 @@ import type {
 import { getErrorMessage } from "../lib/error";
 import { normalizeSkillSearch, skillSearchMatches } from "../lib/skillSearch";
 import { channelsForSkills } from "../lib/skillChannels";
-import { SourceChannelPills } from "../components/SourceChannelPills";
+import { ChannelPills } from "../components/ChannelPills";
 import { TagFilterPills } from "../components/TagFilterPills";
 import {
   buildSourceGroups,
@@ -1339,7 +1339,7 @@ export function MySkills() {
       </div>
 
       <div className="flex flex-wrap items-center gap-1 px-1 -mt-2 -mb-3">
-        <SourceChannelPills
+        <ChannelPills
           channels={channels}
           selected={channelFilters}
           onToggle={(channel) => setChannelFilters(toggleFilter(channelFilters, channel))}
@@ -1404,7 +1404,7 @@ export function MySkills() {
             </>
           )}
         </div>
-        {allTags.length > 0 && (
+        {(allTags.length > 0 || hasUntaggedSkill) && (
           <>
             <span className="mx-0.5 h-3 w-px bg-border-subtle" />
             <TagFilterPills

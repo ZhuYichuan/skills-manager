@@ -26,9 +26,9 @@ import {
 } from "../lib/skillTags";
 import { AgentIcon } from "./AgentIcon";
 import { SkillPickerRow } from "./SkillPickerRow";
-import { SourceChannelPills } from "./SourceChannelPills";
+import { ChannelPills } from "./ChannelPills";
 import { TagFilterPills } from "./TagFilterPills";
-import { channelsForSkills, isKnownChannel } from "../lib/skillChannels";
+import { channelLabel, channelsForSkills } from "../lib/skillChannels";
 
 const VISIBLE_TARGET_ICON_LIMIT = 5;
 
@@ -161,10 +161,7 @@ function AddSkillsSheetBody({ onClose, target, managedSkills, onInstalled }: Pro
   // Same list, same order as My Skills: the shared pills own both.
   const channels = useMemo(() => channelsForSkills(managedSkills), [managedSkills]);
 
-  const sourceLabel = useCallback(
-    (source: string) => (isKnownChannel(source) ? t(`mySkills.sourceFilter.${source}`) : source),
-    [t],
-  );
+  const sourceLabel = useCallback((source: string) => channelLabel(t, source), [t]);
 
   const filtered = useMemo(() => {
     const q = normalizeSkillSearch(search);
@@ -585,6 +582,15 @@ function AddSkillsSheetBody({ onClose, target, managedSkills, onInstalled }: Pro
             />
           </div>
 
+          {/* Channels before tags, as My Skills lays them out: the two rows
+              never reorder between the page and the drawer. */}
+          <ChannelPills
+            channels={channels}
+            selected={sourceFilters}
+            onToggle={toggleSourceFilter}
+            className="mt-2"
+          />
+
           {(allTags.length > 0 || skillsHaveUntagged) && (
             <TagFilterPills
               tags={allTags}
@@ -596,13 +602,6 @@ function AddSkillsSheetBody({ onClose, target, managedSkills, onInstalled }: Pro
               className="mt-2"
             />
           )}
-
-          <SourceChannelPills
-            channels={channels}
-            selected={sourceFilters}
-            onToggle={toggleSourceFilter}
-            className="mt-2"
-          />
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto scrollbar-hide">

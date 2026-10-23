@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CHANNEL_ORDER, channelsForSkills, isKnownChannel } from "./skillChannels";
+import { CHANNEL_ORDER, channelLabel, channelsForSkills, isKnownChannel } from "./skillChannels";
 
 const skill = (source_type: string) => ({ source_type });
 
@@ -37,5 +37,18 @@ describe("isKnownChannel", () => {
   it("does not claim the site channel is known", () => {
     // `well-known` has no pill of its own; it renders as its raw source_type.
     expect(isKnownChannel("well-known")).toBe(false);
+  });
+});
+
+describe("channelLabel", () => {
+  const t = (key: string) => key;
+
+  it("translates the channels this build knows", () => {
+    expect(channelLabel(t, "git")).toBe("mySkills.sourceFilter.git");
+    expect(channelLabel(t, "skillssh")).toBe("mySkills.sourceFilter.skillssh");
+  });
+
+  it("falls back to the raw value so an unknown channel still gets a pill", () => {
+    expect(channelLabel(t, "well-known")).toBe("well-known");
   });
 });

@@ -21,6 +21,18 @@ export function isKnownChannel(channel: string): channel is KnownChannel {
  * reports that this build does not know about — `well-known` today — sorted so
  * the extra pills at least hold still.
  */
+/**
+ * What to call a Channel in the UI. A channel this build does not name is shown
+ * as its raw `source_type` rather than hidden, so the pill still reaches those
+ * skills and the user can see what they are called.
+ */
+export function channelLabel(
+  t: (key: string) => string,
+  channel: string
+): string {
+  return isKnownChannel(channel) ? t(`mySkills.sourceFilter.${channel}`) : channel;
+}
+
 export function channelsForSkills(skills: { source_type: string }[]): string[] {
   const extra = new Set<string>();
   for (const skill of skills) {
