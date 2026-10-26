@@ -2710,7 +2710,7 @@ fn apply_prepared_update(
                 // head keeps the next check from re-diffing what this fetch
                 // just read, and clears the `updating` marker.
                 store
-                    .update_skill_check_state(&skill.id, Some(&revision), "update_available", None)
+                    .update_skill_check_state(&skill.id, Some(&revision), "moved", None)
                     .map_err(AppError::db)?;
                 return Ok(UpdateOutcome::Moved { candidates });
             }
@@ -2719,7 +2719,7 @@ fn apply_prepared_update(
                     .update_skill_check_state(
                         &skill.id,
                         skill.remote_revision.as_deref(),
-                        "error",
+                        "source_gone",
                         Some(SOURCE_GONE_MESSAGE),
                     )
                     .map_err(AppError::db)?;
@@ -3497,9 +3497,12 @@ fn should_skip_update_check(
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(60);
     let ttl_ms = ttl_minutes * 60 * 1000;
-    let stable_status = !matches!(
+    // Statuses a TTL round must not re-check: the answer is already known and
+    // asking again cannot change it. `moved` and `source_gone` are answers, not
+    // transient states, so they settle like `up_to_date` does.
+    let stable_status = matches!(
         skill.update_status.as_str(),
-        "unknown" | "checking" | "updating" | "error"
+        "up_to_date" | "update_available" | "source_missing" | "local_only" | "moved" | "source_gone"
     );
 
     Ok(stable_status
@@ -4695,7 +4698,7 @@ mod tests {
         assert_eq!(after.source_subpath.as_deref(), Some("skill"));
         assert_eq!(after.source_revision.as_deref(), Some("rev1"));
         // Waiting on that decision, not stuck at `updating` forever.
-        assert_eq!(after.update_status, "update_available");
+        assert_eq!(after.update_status, "moved");
         assert!(after.last_check_error.is_none());
     }
 
@@ -4735,6 +4738,7 @@ mod tests {
         }
         let after = repo.store.get_skill_by_id(&record.id).unwrap().unwrap();
         assert_eq!(after.source_subpath.as_deref(), Some("skill"));
+        assert_eq!(after.update_status, "moved");
     }
 
     /// The Source really did delete it. Counting this as a failure is what made
@@ -4761,8 +4765,35 @@ mod tests {
         assert_eq!(fs::read_to_string(central.join("a.txt")).unwrap(), "keep");
         let after = repo.store.get_skill_by_id(&record.id).unwrap().unwrap();
         assert_eq!(after.source_subpath.as_deref(), Some("skill"));
-        assert_eq!(after.update_status, "error");
+        assert_eq!(after.update_status, "source_gone");
         assert_eq!(after.last_check_error.as_deref(), Some(SOURCE_GONE_MESSAGE));
+    }
+
+    /// The two answers are stable, not transient: a TTL round must not re-check
+    /// them and turn a settled move or deletion back into a failed revision
+    /// comparison. Forcing a check still asks, so the user can revisit.
+    #[test]
+    fn moved_and_source_gone_are_stable_for_the_ttl() {
+        let repo = test_repo();
+        let dir = write_skill_dir("skill-1");
+        repo.store
+            .insert_skill(&sample_skill("skill-1", "skill-1", &dir))
+            .unwrap();
+
+        for status in ["moved", "source_gone"] {
+            repo.store
+                .update_skill_check_state("skill-1", Some("rev"), status, None)
+                .unwrap();
+            let stored = repo.store.get_skill_by_id("skill-1").unwrap().unwrap();
+            assert!(
+                should_skip_update_check(&repo.store, &stored, false).unwrap(),
+                "{status} should be skipped within the TTL"
+            );
+            assert!(
+                !should_skip_update_check(&repo.store, &stored, true).unwrap(),
+                "an explicit check must still run for {status}"
+            );
+        }
     }
 
     // ── RemoteIdentity dedup (batch check_all fan-out) ──

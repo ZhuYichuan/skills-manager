@@ -371,7 +371,9 @@
       "available": "可更新",
       "error": "检查失败",
       "localOnly": "本地来源",
-      "sourceMissing": "原路径丢失"
+      "sourceMissing": "原路径丢失",
+      "moved": "上游已改名",
+      "sourceGone": "上游已删除"
     },
     "updateActions": {
       "check": "检查",

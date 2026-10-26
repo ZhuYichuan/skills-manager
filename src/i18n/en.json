@@ -371,7 +371,9 @@
       "available": "Update available",
       "error": "Check failed",
       "localOnly": "Local source",
-      "sourceMissing": "Source missing"
+      "sourceMissing": "Source missing",
+      "moved": "Moved upstream",
+      "sourceGone": "Deleted upstream"
     },
     "updateActions": {
       "check": "Check",

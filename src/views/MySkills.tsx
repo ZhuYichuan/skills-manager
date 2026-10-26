@@ -1157,10 +1157,15 @@ export function MySkills() {
     }
   };
 
+  // `moved` and `source_gone` have no update to apply: one waits for the user
+  // to re-point its source, the other has nothing left upstream. Offering
+  // "Update" for either is the failed-forever button this replaces.
   const canRefresh = (skill: ManagedSkill) =>
-    skill.source_type === "git" ||
-    skill.source_type === "skillssh" ||
-    ((skill.source_type === "local" || skill.source_type === "import") && !!skill.source_ref);
+    skill.update_status !== "moved" &&
+    skill.update_status !== "source_gone" &&
+    (skill.source_type === "git" ||
+      skill.source_type === "skillssh" ||
+      ((skill.source_type === "local" || skill.source_type === "import") && !!skill.source_ref));
 
   const anyRefreshableSelected = useMemo(
     () => skills.some((skill) => selectedIds.has(skill.id) && canRefresh(skill)),
@@ -1206,6 +1211,18 @@ export function MySkills() {
       return {
         label: t("mySkills.updateStatus.sourceMissing"),
         className: "bg-red-500/10 text-red-600 dark:text-red-300",
+      };
+    }
+    if (skill.update_status === "moved") {
+      return {
+        label: t("mySkills.updateStatus.moved"),
+        className: "bg-sky-500/12 text-sky-600 dark:text-sky-400",
+      };
+    }
+    if (skill.update_status === "source_gone") {
+      return {
+        label: t("mySkills.updateStatus.sourceGone"),
+        className: "bg-slate-500/12 text-slate-600 dark:text-slate-300",
       };
     }
     if (skill.update_status === "error") {
