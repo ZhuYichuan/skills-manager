@@ -32,6 +32,7 @@ pub mod skill_auto_updater;
 pub mod skill_metadata;
 pub mod skill_store;
 pub mod skillssh_api;
+pub mod source_membership;
 pub mod sync_engine;
 pub mod sync_metadata;
 pub mod timing;
