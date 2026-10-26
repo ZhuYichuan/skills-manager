@@ -4,9 +4,9 @@
 
 **Blocked by:** 02
 
-**Status:** ready-for-agent
+**Status:** done (7bb59bf)
 
-- [ ] `moved` / `source_gone` 写入后，TTL 内 `should_skip_update_check` 返回 true
-- [ ] 批量选择器不包含两者
-- [ ] 列表徽标区分“已改名”与“上游已删除”
-- [ ] 前端类型与 i18n 同步（en / zh / zh-TW）
+- [x] `moved` / `source_gone` 写入后，TTL 内 `should_skip_update_check` 返回 true
+- [x] 批量选择器不包含两者
+- [x] 列表徽标区分“已改名”与“上游已删除”
+- [x] 前端类型与 i18n 同步（en / zh / zh-TW）
