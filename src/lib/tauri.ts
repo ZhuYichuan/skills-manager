@@ -335,6 +335,14 @@ export interface UpdateSkillResult {
    * approves that list at that revision and nothing else.
    */
   removal_approval: string | null;
+  /**
+   * Where the Source says the skill went, strongest first. Empty unless the
+   * recorded path no longer holds it — the batch's `moved` bucket, for one
+   * skill. Nothing was written: re-pointing is the user's call.
+   */
+  moved: MoveCandidate[];
+  /** The Source no longer holds this skill anywhere. Not a failure. */
+  gone: boolean;
 }
 
 export interface PendingRemoval {

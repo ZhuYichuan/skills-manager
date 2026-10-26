@@ -43,6 +43,13 @@ pub struct UpdateSkillResult {
     /// remote moves on, or the skill writes another file while the dialog is
     /// open, the approval no longer matches and the user is asked again.
     pub removal_approval: Option<String>,
+    /// Where the Source says the skill went, strongest candidate first. Empty
+    /// unless the recorded path no longer holds it: the batch's `moved` bucket,
+    /// for one skill. Nothing was written — re-pointing is the user's call.
+    pub moved: Vec<MoveCandidate>,
+    /// True when the Source no longer holds this skill anywhere. Not a failure:
+    /// retrying cannot help, so the row offers detach or delete instead.
+    pub gone: bool,
 }
 
 /// Stands in for a revision when binding a re-import's approval: there is no
@@ -955,6 +962,13 @@ fn log_update_outcome(
     outcome: Result<&UpdateSkillResult, &AppError>,
 ) {
     let (name, entry) = match outcome {
+        Ok(result) if result.gone => (result.skill.name.clone(), UpdateAudit::Gone),
+        Ok(result) if !result.moved.is_empty() => (
+            result.skill.name.clone(),
+            UpdateAudit::Moved {
+                candidates: &result.moved,
+            },
+        ),
         Ok(result) if !result.pending_removals.is_empty() => (
             result.skill.name.clone(),
             UpdateAudit::Held {
@@ -2604,19 +2618,21 @@ pub fn update_git_skill_internal(
     let update_result = apply_prepared_update(store, &skill, &prepared, approved_removals, true);
     match update_result {
         Ok(outcome) => {
-            let (content_changed, pending_removals, removal_approval) = match outcome {
-                UpdateOutcome::Applied { content_changed } => (content_changed, Vec::new(), None),
-                UpdateOutcome::Held { pending, approval } => (false, pending, Some(approval)),
-                // One skill at a time has nowhere to put a bucket, so the round's
-                // `moved` / `gone` answers come back as the reason instead of a
-                // silent success. Ticket 04 turns the moved case into a one-click
-                // re-point; until then retrying this skill cannot help either.
+            // A move and a deletion are answers, not errors: both left the
+            // library untouched and both ask the user for an action, so they
+            // come back as fields the caller can describe in the same words the
+            // batch uses. Only an actual failure is an `Err`.
+            let (content_changed, pending_removals, removal_approval, moved, gone) = match outcome {
+                UpdateOutcome::Applied { content_changed } => {
+                    (content_changed, Vec::new(), None, Vec::new(), false)
+                }
+                UpdateOutcome::Held { pending, approval } => {
+                    (false, pending, Some(approval), Vec::new(), false)
+                }
                 UpdateOutcome::Moved { candidates } => {
-                    return Err(moved_source_error(&candidates));
+                    (false, Vec::new(), None, candidates, false)
                 }
-                UpdateOutcome::Gone => {
-                    return Err(AppError::not_found(SOURCE_GONE_MESSAGE));
-                }
+                UpdateOutcome::Gone => (false, Vec::new(), None, Vec::new(), true),
             };
             let skill = managed_skill_by_id(store, skill_id)?;
             Ok(UpdateSkillResult {
@@ -2624,6 +2640,8 @@ pub fn update_git_skill_internal(
                 content_changed,
                 pending_removals,
                 removal_approval,
+                moved,
+                gone,
             })
         }
         Err(e) => {
@@ -2843,19 +2861,6 @@ fn locate_update_site(
         // `At` returned above; the remaining answer is `Gone`.
         _ => UpdateSite::Gone,
     })
-}
-
-/// The single-skill path's answer to a move: an error naming where the Source
-/// says the skill went, since there is no bucket to file it under and nothing to
-/// apply. The batch reports the same skill as `moved` instead.
-fn moved_source_error(candidates: &[MoveCandidate]) -> AppError {
-    match candidates.first() {
-        Some(first) => AppError::not_found(format!(
-            "The skill moved upstream to '{}'; re-point its source to keep updating it",
-            first.subpath
-        )),
-        None => AppError::not_found("The skill's recorded path no longer holds it upstream"),
-    }
 }
 
 /// Install a skill from a checkout that is already on disk.
@@ -5195,6 +5200,72 @@ mod tests {
                 "{status} (force={force}) must keep exactly its own candidates"
             );
         }
+    }
+
+    /// Medium 3: one skill at a time reaches the same audit vocabulary as a
+    /// batch. A move and a deletion are answers — a `Failed` entry would show
+    /// the skill as "check failed" in the history and invite a retry that
+    /// cannot work.
+    #[test]
+    fn a_single_skills_move_and_deletion_are_audited_as_answers() {
+        let repo = test_repo();
+        let dir = write_skill_dir("skill-1");
+        repo.store
+            .insert_skill(&sample_skill("skill-1", "skill-1", &dir))
+            .unwrap();
+        let candidates = vec![MoveCandidate {
+            subpath: "moved-here".to_string(),
+            confidence: Confidence::High,
+            reason: source_membership::MoveReason::ContentHash,
+        }];
+
+        log_update_outcome(
+            &repo.store,
+            "skill-1",
+            "git",
+            Ok(&UpdateSkillResult {
+                skill: managed_skill_by_id(&repo.store, "skill-1").unwrap(),
+                content_changed: false,
+                pending_removals: Vec::new(),
+                removal_approval: None,
+                moved: candidates,
+                gone: false,
+            }),
+        );
+        log_update_outcome(
+            &repo.store,
+            "skill-1",
+            "git",
+            Ok(&UpdateSkillResult {
+                skill: managed_skill_by_id(&repo.store, "skill-1").unwrap(),
+                content_changed: false,
+                pending_removals: Vec::new(),
+                removal_approval: None,
+                moved: Vec::new(),
+                gone: true,
+            }),
+        );
+
+        let entries = repo.store.list_audit(None).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries.iter().all(|entry| entry.success),
+            "neither answer is a failure"
+        );
+        assert!(
+            entries[0].detail.as_deref().unwrap_or("").contains("gone upstream"),
+            "got: {:?}",
+            entries[0].detail
+        );
+        assert!(
+            entries[1]
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("moved upstream — first candidate 'moved-here'"),
+            "got: {:?}",
+            entries[1].detail
+        );
     }
 
     // ── RemoteIdentity dedup (batch check_all fan-out) ──

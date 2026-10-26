@@ -925,17 +925,30 @@ export function MySkills() {
         toast.success(t("mySkills.updateActions.reimported"));
       } else {
         const result = await api.updateSkill(skill.id, approvedRemovals);
-        // Nothing was changed: the update would have taken away files the new
-        // version does not have. Show them and let the user decide (#256).
-        if (result.pending_removals.length > 0) {
+        // A move and a deletion are answers, not failures, and one skill is
+        // told the same way a batch is: same wording, count of one.
+        if (result.moved.length > 0) {
+          toast.warning(
+            t("mySkills.batchMovedSources", {
+              count: 1,
+              names: skill.name,
+              path: result.moved[0]?.subpath ?? "",
+            })
+          );
+        } else if (result.gone) {
+          toast.warning(
+            t("mySkills.batchGoneSources", { count: 1, names: skill.name })
+          );
+        } else if (result.pending_removals.length > 0) {
+          // Nothing was changed: the update would have taken away files the new
+          // version does not have. Show them and let the user decide (#256).
           setPendingRemoval({
             skill,
             removals: result.pending_removals,
             approval: result.removal_approval,
           });
           return;
-        }
-        if (result.content_changed) {
+        } else if (result.content_changed) {
           toast.success(t("mySkills.updateActions.updated"));
         } else {
           toast.info(t("mySkills.updateActions.alreadyUpToDate"));
