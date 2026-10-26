@@ -39,6 +39,11 @@ export interface ManagedSkill {
   targets: SkillTarget[];
   preset_ids: string[];
   tags: string[];
+  /**
+   * Where the last `moved` check found this skill in its Source. Empty for
+   * every other status; persisted so a restart can still offer the re-point.
+   */
+  move_candidates: MoveCandidate[];
 }
 
 export interface SkillTarget {
@@ -344,6 +349,13 @@ export const updateSkill = (skillId: string, approvedRemovals?: string | null) =
     skillId,
     approvedRemovals: approvedRemovals ?? null,
   });
+
+/**
+ * Move a skill's source pointer to a path the Source proposed. This writes the
+ * pointer only: the library copy and its content hash are untouched.
+ */
+export const repointSkillSource = (skillId: string, subpath: string) =>
+  invoke<ManagedSkill>("repoint_skill_source", { skillId, subpath });
 
 export interface BatchUpdateSkillsResult {
   refreshed: number;

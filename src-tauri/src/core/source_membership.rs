@@ -25,7 +25,7 @@
 
 use std::path::{Component, Path};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::core::content_hash;
@@ -43,7 +43,7 @@ const MAX_SCAN_DEPTH: usize = 6;
 const PRUNED_DIRS: &[&str] = &[".git"];
 
 /// How sure we are that a candidate is the same skill as the stored record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Confidence {
     /// The directory's content hash equals the stored `content_hash`: same
@@ -59,7 +59,7 @@ pub enum Confidence {
 /// The variants are exclusive and ordered strongest-first: a directory whose
 /// content hash matches is reported as [`MoveReason::ContentHash`] even if its
 /// name matches too, so the reason always names the most concrete evidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MoveReason {
     /// Directory content hash equals the stored `content_hash`.
@@ -71,7 +71,7 @@ pub enum MoveReason {
 }
 
 /// One place the skill might have moved to.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MoveCandidate {
     /// Path relative to the checkout root, `/`-separated, with no `./` or
     /// trailing slash — the form that goes straight back into
@@ -258,7 +258,7 @@ fn relative_subpath(checkout: &Path, dir: &Path) -> Option<String> {
 ///
 /// `None` means the stored path cannot name a directory inside the checkout
 /// (absolute, or climbing out with `..`); `Some("")` means the checkout root.
-fn normalize_subpath(raw: Option<&str>) -> Option<String> {
+pub(crate) fn normalize_subpath(raw: Option<&str>) -> Option<String> {
     let raw = raw.unwrap_or("").trim().trim_matches('/');
     if raw.is_empty() {
         return Some(String::new());

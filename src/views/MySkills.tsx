@@ -51,10 +51,12 @@ import * as api from "../lib/tauri";
 import { getTagActiveColor, getTagColor, pruneStaleTagFilters, UNTAGGED_FILTER } from "../lib/skillTags";
 import type {
   ManagedSkill,
+  MoveCandidate,
   ToolInfo,
   GitBackupStatus,
   SkillToolToggle,
 } from "../lib/tauri";
+import { repointChoice } from "../lib/sourceRepoint";
 import { getErrorMessage } from "../lib/error";
 import { normalizeSkillSearch, skillSearchMatches } from "../lib/skillSearch";
 import {
@@ -996,6 +998,87 @@ export function MySkills() {
     }
   };
 
+  const handleRepointSource = async (skill: ManagedSkill, subpath: string) => {
+    setUpdatingSkillId(skill.id);
+    try {
+      await api.repointSkillSource(skill.id, subpath);
+      toast.success(t("mySkills.updateActions.repointed"));
+      await refreshManagedSkills();
+    } catch (error: unknown) {
+      toast.error(getErrorMessage(error, t("common.error")));
+      await refreshManagedSkills();
+    } finally {
+      setUpdatingSkillId(null);
+    }
+  };
+
+  /**
+   * The candidate paths, their reason, and the one control that follows them.
+   * A single high-confidence candidate re-points in one click; anything else
+   * lists every path so the click names the one the user picked.
+   */
+  const moveCandidates = (skill: ManagedSkill, layout: "grid" | "list") => {
+    if (isMultiSelect || skill.update_status !== "moved") return null;
+    const choice = repointChoice(skill.move_candidates);
+    if (choice.kind === "none") return null;
+    const busy = updatingSkillId === skill.id;
+
+    return (
+      <div
+        className={cn(
+          "flex flex-col gap-1",
+          layout === "grid" ? "mt-2" : "min-w-0 max-w-[42%] shrink-0"
+        )}
+        onClick={(event) => event.stopPropagation()}
+      >
+        {choice.kind === "choose" && (
+          <span className="text-[11px] font-medium text-muted">
+            {t("mySkills.move.choosePath")}
+          </span>
+        )}
+        {skill.move_candidates.map((candidate) => (
+          <div
+            key={`${candidate.subpath}:${candidate.reason}`}
+            className="flex min-w-0 items-center gap-1.5"
+          >
+            <code
+              className={cn(
+                "truncate rounded-md bg-surface-hover px-1 py-0.5 font-mono text-[11px] text-secondary",
+                layout === "grid" ? "max-w-[60%]" : "max-w-[220px]"
+              )}
+              title={candidate.subpath || "."}
+            >
+              {candidate.subpath || "."}
+            </code>
+            <span className="shrink-0 text-[11px] text-faint">
+              {moveReasonLabel(candidate.reason)}
+            </span>
+            <button
+              onClick={(event) => {
+                event.stopPropagation();
+                void handleRepointSource(skill, candidate.subpath);
+              }}
+              disabled={busy}
+              className={cn(
+                "shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium transition-colors disabled:opacity-50",
+                choice.kind === "oneClick"
+                  ? "bg-sky-500/12 text-sky-600 hover:bg-sky-500/20 dark:text-sky-400"
+                  : "border border-border-subtle text-secondary hover:bg-surface-hover"
+              )}
+            >
+              {choice.kind === "oneClick"
+                ? t("mySkills.updateActions.repoint")
+                : t("mySkills.updateActions.useThisPath")}
+            </button>
+          </div>
+        ))}
+      </div>
+    );
+  };
+
+  const moveReasonLabel = (reason: MoveCandidate["reason"]) =>
+    t(`mySkills.moveReason.${reason}`);
+
   const handleAddTag = async (skill: ManagedSkill, inputValue?: string) => {
     const trimmed = (inputValue ?? tagInput).trim();
     if (!trimmed || skill.tags.includes(trimmed)) {
@@ -1757,6 +1840,7 @@ export function MySkills() {
                     <p className="text-[13px] leading-[18px] text-muted truncate">
                       {skill.description || "—"}
                     </p>
+                    {moveCandidates(skill, "grid")}
                     {((badge && !showUpdatePill) || conflictIds.has(skill.id)) && (
                       <div className="mt-2 flex flex-wrap items-center gap-1.5">
                         {conflictIds.has(skill.id) && (
@@ -1959,6 +2043,8 @@ export function MySkills() {
                 <p className="min-w-0 flex-1 truncate text-[13px] text-muted">
                   {skill.description || "—"}
                 </p>
+
+                {moveCandidates(skill, "list")}
 
                 <div className="flex shrink-0 items-center gap-1.5">
                   {skill.tags.map((tag) => (

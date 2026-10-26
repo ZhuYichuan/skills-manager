@@ -258,6 +258,10 @@ pub struct ManagedSkillDto {
     pub targets: Vec<TargetDto>,
     pub preset_ids: Vec<String>,
     pub tags: Vec<String>,
+    /// Where the last `moved` check found this skill in its Source. Empty for
+    /// every other status. Persisted so the row can still offer the one-click
+    /// re-point after a restart, when the checkout is long gone.
+    pub move_candidates: Vec<MoveCandidate>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2428,6 +2432,7 @@ fn managed_skill_to_dto(
 
     let preset_ids = store.get_scenarios_for_skill(&skill.id).unwrap_or_default();
     let tags = tags_map.get(&skill.id).cloned().unwrap_or_default();
+    let move_candidates = store.get_skill_move_candidates(&skill.id).unwrap_or_default();
 
     // Prefer description from SKILL.md so the list view reflects edits made
     // directly on disk (file watcher emits a change event; this read serves
@@ -2460,6 +2465,7 @@ fn managed_skill_to_dto(
         targets,
         preset_ids,
         tags,
+        move_candidates,
     }
 }
 
@@ -2545,6 +2551,92 @@ pub fn update_git_skill_internal(
             Err(e)
         }
     }
+}
+
+/// Move a skill's source pointer to where the Source says it went.
+///
+/// This is deliberately the whole action: `source_subpath` is the only column
+/// written, and no skill content is copied, deleted or replaced. A rename
+/// upstream changes where the next update should fetch from, not what the user
+/// has on disk, so `central_path`, `content_hash` and every installed file stay
+/// exactly as they were; only the metadata mirror is refreshed so the pointer
+/// survives the next startup. The row returns to `update_available`: the verdict
+/// belonged to the old path, and the next check decides with the new one.
+///
+/// Keeping `source_ref_resolved` and the branch/revision is what makes this a
+/// pointer move rather than a quiet reinstall: the Source is unchanged, only the
+/// directory inside it is.
+pub fn repoint_skill_source_internal(
+    store: &SkillStore,
+    skill_id: &str,
+    subpath: &str,
+) -> Result<ManagedSkillDto, AppError> {
+    let skill = store
+        .get_skill_by_id(skill_id)
+        .map_err(AppError::db)?
+        .ok_or_else(|| AppError::not_found("Skill not found"))?;
+
+    if !is_git_channel(&skill.source_type) {
+        return Err(AppError::invalid_input(
+            "Only git-based skills can re-point their source",
+        ));
+    }
+
+    let subpath = source_membership::normalize_subpath(Some(subpath)).ok_or_else(|| {
+        AppError::invalid_input("The new source path must be relative to the repository root")
+    })?;
+    let stored_subpath = (!subpath.is_empty()).then_some(subpath.as_str());
+
+    sync_metadata::with_repo_lock("re-point skill source", || {
+        store.update_skill_source_metadata(
+            &skill.id,
+            skill.source_ref_resolved.as_deref(),
+            stored_subpath,
+            skill.source_branch.as_deref(),
+            skill.source_revision.as_deref(),
+        )?;
+        // `update_available` belongs to the new path, and clears the move
+        // candidates: their answer was about the old one. The check time is
+        // set here too, so a TTL round does not immediately re-ask.
+        store.update_skill_check_state(
+            &skill.id,
+            skill.remote_revision.as_deref(),
+            "update_available",
+            None,
+        )?;
+        // The metadata snapshot is the database's mirror and is what startup
+        // reindexes from; without this line the new pointer would be undone by
+        // the old file on the next launch. It writes no skill content — the
+        // library copy and its hash stay exactly as they were.
+        sync_metadata::ensure_skill_metadata_unlocked(store, skill_id)
+    })
+    .map_err(AppError::db)?;
+
+    store.log_audit(
+        AuditDraft::new("repoint")
+            .skill(skill.id.clone(), skill.name.clone())
+            .detail(format!(
+                "{} -> {}",
+                skill.source_subpath.as_deref().unwrap_or("."),
+                if subpath.is_empty() { "." } else { subpath.as_str() }
+            ))
+            .ok(),
+    );
+
+    managed_skill_by_id(store, skill_id)
+}
+
+#[tauri::command]
+pub async fn repoint_skill_source(
+    skill_id: String,
+    subpath: String,
+    store: State<'_, Arc<SkillStore>>,
+) -> Result<ManagedSkillDto, AppError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        repoint_skill_source_internal(&store, &skill_id, &subpath)
+    })
+    .await?
 }
 
 /// A Source's code, resolved and on disk, fetched before any lock is taken.
@@ -2703,14 +2795,25 @@ fn apply_prepared_update(
     let checkout = &prepared.checkout;
     let update_result = (|| -> Result<UpdateOutcome, AppError> {
         let skill_dir = match locate_update_site(skill, source, checkout)? {
-            UpdateSite::At(dir) => dir,
+            UpdateSite::At(dir) => {
+                // Any earlier move answer is spent: this path holds the skill.
+                store
+                    .clear_skill_move_candidates(&skill.id)
+                    .map_err(AppError::db)?;
+                dir
+            }
             UpdateSite::Moved(candidates) => {
                 // Nothing to apply and nothing to fail: the update is waiting on
                 // a decision that is not this round's to make. Recording the
                 // head keeps the next check from re-diffing what this fetch
-                // just read, and clears the `updating` marker.
+                // just read, and clears the `updating` marker. The candidates
+                // are cached for the UI, which has to offer the button after a
+                // restart too.
                 store
                     .update_skill_check_state(&skill.id, Some(&revision), "moved", None)
+                    .map_err(AppError::db)?;
+                store
+                    .replace_skill_move_candidates(&skill.id, &candidates)
                     .map_err(AppError::db)?;
                 return Ok(UpdateOutcome::Moved { candidates });
             }
@@ -4739,6 +4842,80 @@ mod tests {
         let after = repo.store.get_skill_by_id(&record.id).unwrap().unwrap();
         assert_eq!(after.source_subpath.as_deref(), Some("skill"));
         assert_eq!(after.update_status, "moved");
+    }
+
+    /// Re-pointing is a pointer move and nothing else: the library copy — even
+    /// a file the user put there after the move was found — stays byte for
+    /// byte, and the row returns to `update_available` so the next check can
+    /// judge the new path.
+    #[test]
+    fn repointing_moves_only_the_source_pointer() {
+        let repo = test_repo();
+        let (record, prepared, checkout) = prepared_fixture(
+            &repo,
+            &[("a.txt", "same")],
+            &[("a.txt", "same")],
+        );
+        // Identical bytes at a new path, `SKILL.md` included: the high-confidence
+        // answer, and the one the UI offers as a single click.
+        let installed = fs::read_to_string(checkout.path().join("skill/SKILL.md")).unwrap();
+        rewrite_checkout(
+            &checkout,
+            &[
+                ("moved-here/SKILL.md", installed.as_str()),
+                ("moved-here/a.txt", "same"),
+            ],
+        );
+        let before = repo.store.get_skill_by_id(&record.id).unwrap().unwrap();
+        let outcome = apply_prepared_update(&repo.store, &record, &prepared, None, false).unwrap();
+        assert!(matches!(outcome, UpdateOutcome::Moved { .. }));
+
+        // The candidate must still be there when the UI comes back later; the
+        // checkout is gone by then.
+        let stored_candidates = repo.store.get_skill_move_candidates(&record.id).unwrap();
+        assert_eq!(stored_candidates.len(), 1);
+        assert_eq!(stored_candidates[0].subpath, "moved-here");
+        assert_eq!(stored_candidates[0].confidence, Confidence::High);
+
+        // Work the user did while the row sat at `moved`. Re-pointing must not
+        // consult the library at all, let alone replace it.
+        let library = Path::new(&record.central_path);
+        fs::write(library.join("mine.txt"), "user work").unwrap();
+
+        let dto = repoint_skill_source_internal(&repo.store, &record.id, "moved-here").unwrap();
+
+        assert_eq!(dto.source_subpath.as_deref(), Some("moved-here"));
+        assert_eq!(dto.update_status, "update_available");
+        assert_eq!(dto.last_check_error, None);
+        assert_eq!(dto.central_path, before.central_path);
+        assert_eq!(dto.source_ref_resolved, before.source_ref_resolved);
+        assert_eq!(dto.source_branch, before.source_branch);
+        assert_eq!(dto.source_revision, before.source_revision);
+
+        let after = repo.store.get_skill_by_id(&record.id).unwrap().unwrap();
+        assert_eq!(after.source_subpath.as_deref(), Some("moved-here"));
+        assert_eq!(after.central_path, before.central_path);
+        assert_eq!(after.content_hash, before.content_hash);
+        assert_eq!(after.source_ref_resolved, before.source_ref_resolved);
+        assert_eq!(after.source_revision, before.source_revision);
+        assert_eq!(
+            fs::read_to_string(library.join("mine.txt")).unwrap(),
+            "user work"
+        );
+        assert_eq!(fs::read_to_string(library.join("a.txt")).unwrap(), "same");
+        assert!(
+            repo.store
+                .get_skill_move_candidates(&record.id)
+                .unwrap()
+                .is_empty(),
+            "the move answer is spent once the pointer follows it"
+        );
+
+        // Startup reindexes the database from the metadata mirror. The pointer
+        // has to be there too, or the next launch quietly undoes the click.
+        crate::core::sync_metadata::reindex_from_metadata_unlocked(&repo.store).unwrap();
+        let reindexed = repo.store.get_skill_by_id(&record.id).unwrap().unwrap();
+        assert_eq!(reindexed.source_subpath.as_deref(), Some("moved-here"));
     }
 
     /// The Source really did delete it. Counting this as a failure is what made

@@ -374,6 +374,14 @@
       "moved": "上游已改名",
       "sourceGone": "上游已刪除"
     },
+    "move": {
+      "choosePath": "有多個位置匹配，請選擇新的路徑："
+    },
+    "moveReason": {
+      "content_hash": "目錄內容與已安裝副本一致",
+      "directory_name": "目錄名相同",
+      "frontmatter_name": "SKILL.md 名稱相同"
+    },
     "updateActions": {
       "check": "檢查",
       "checkAll": "檢查全部",
@@ -387,6 +395,9 @@
       "relinked": "已重新關聯原路徑",
       "detachSource": "轉為本機副本",
       "detachedSource": "已取消原路徑追蹤",
+      "repoint": "重新指向來源",
+      "repointed": "來源已重新指向",
+      "useThisPath": "使用此路徑",
       "alreadyUpToDate": "Skill 內容未變化（版本已同步）",
       "removalTitle": "這次更新會刪除檔案",
       "removalMessage": "更新 {{name}} 會移除 {{count}} 個新版本裡沒有的檔案。如果其中有你自己的東西，先把它移到 skill 資料夾以外——目前還沒有任何改動。",
