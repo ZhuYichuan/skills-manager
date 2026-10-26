@@ -4,10 +4,10 @@
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** done (2e307a0)
 
-- [ ] At 路径行为不变（现有 641 个测试仍绿）
-- [ ] Moved 进入 `moved_sources`，携带候选 subpath 与置信度
-- [ ] Gone 进入 `gone_sources`
-- [ ] 真正的失败仍进 `failed`，四类互不重叠
-- [ ] 轮次日志一行含四个计数
+- [x] At 路径行为不变（现有 641 个测试仍绿）
+- [x] Moved 进入 `moved_sources`，携带候选 subpath 与置信度
+- [x] Gone 进入 `gone_sources`
+- [x] 真正的失败仍进 `failed`，四类互不重叠
+- [x] 轮次日志一行含四个计数
