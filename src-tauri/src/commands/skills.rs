@@ -1978,6 +1978,57 @@ pub struct RoundProgress<'a> {
 /// Cancel key for the foreground batch, next to the per-skill `update:<id>`.
 pub const BATCH_UPDATE_CANCEL_KEY: &str = "update-batch";
 
+/// The round's counters, one per end state.
+///
+/// A finished skill is filed by one `match` on its outcome, so the buckets are
+/// alternatives and never additions: nothing is counted twice, and nothing
+/// recoverable by re-pointing or detaching is also counted as a failure. Kept
+/// as a value rather than a handful of loose counters so that rule is
+/// assertable without a git remote in the test.
+#[derive(Default)]
+struct RoundTally {
+    refreshed: usize,
+    unchanged: usize,
+    held_back: Vec<String>,
+    held_back_paths: usize,
+    moved_sources: Vec<MovedSource>,
+    gone_sources: Vec<String>,
+    failed: Vec<String>,
+}
+
+impl RoundTally {
+    /// File one finished skill under exactly one heading.
+    fn record(&mut self, name: &str, outcome: &Result<UpdateOutcome, AppError>) {
+        match outcome {
+            Ok(UpdateOutcome::Applied { content_changed: true }) => self.refreshed += 1,
+            Ok(UpdateOutcome::Applied { content_changed: false }) => self.unchanged += 1,
+            Ok(UpdateOutcome::Held { pending, .. }) => {
+                self.held_back_paths += pending.len();
+                self.held_back.push(name.to_string());
+            }
+            Ok(UpdateOutcome::Moved { candidates }) => self.moved_sources.push(MovedSource {
+                name: name.to_string(),
+                candidates: candidates.clone(),
+            }),
+            Ok(UpdateOutcome::Gone) => self.gone_sources.push(name.to_string()),
+            Err(err) => self.failed.push(format!("{name}: {}", err.message)),
+        }
+    }
+
+    fn into_result(self, cancelled: bool) -> BatchUpdateSkillsResult {
+        BatchUpdateSkillsResult {
+            refreshed: self.refreshed,
+            unchanged: self.unchanged,
+            failed: self.failed,
+            held_back: self.held_back,
+            cancelled,
+            held_back_paths: self.held_back_paths,
+            moved_sources: self.moved_sources,
+            gone_sources: self.gone_sources,
+        }
+    }
+}
+
 /// Update a set of skills: resoleach Source once, then fetch and apply.
 pub fn run_update_round(
     store: &SkillStore,
@@ -1987,14 +2038,8 @@ pub fn run_update_round(
     let total = skill_ids.len();
     let mut done = 0usize;
     let mut cancelled = false;
-    let mut held_back_paths = 0usize;
-    let mut moved_sources: Vec<MovedSource> = Vec::new();
-    let mut gone_sources: Vec<String> = Vec::new();
-    let mut refreshed = 0usize;
-    let mut unchanged = 0usize;
+    let mut tally = RoundTally::default();
     let proxy_url = store.proxy_url();
-    let mut failed = Vec::new();
-    let mut held_back = Vec::new();
 
     // Group by Source before doing anything: a library built from a dozen
     // repositories holds many skills per repository, and every skill used to
@@ -2004,7 +2049,7 @@ pub fn run_update_round(
     for skill_id in skill_ids {
         match store.get_skill_by_id(&skill_id).map_err(AppError::db)? {
             Some(skill) => loaded.push((skill_id, skill)),
-            None => failed.push(format!("{skill_id}: Skill not found")),
+            None => tally.failed.push(format!("{skill_id}: Skill not found")),
         }
     }
     let report = |done: usize, skill: &str, started: bool| {
@@ -2022,16 +2067,7 @@ pub fn run_update_round(
 
     if is_cancelled() {
         // Stopping must not cost a round of network calls first.
-        return Ok(BatchUpdateSkillsResult {
-            refreshed,
-            unchanged,
-            failed,
-            held_back,
-            cancelled: true,
-            held_back_paths,
-            moved_sources,
-            gone_sources,
-        });
+        return Ok(tally.into_result(true));
     }
 
     let (groups, ungrouped) = group_by_source(loaded);
@@ -2049,10 +2085,12 @@ pub fn run_update_round(
                 log_reimport_outcome(store, &skill_id, outcome.as_ref());
                 match outcome {
                     Ok(result) if !result.pending_removals.is_empty() => {
-                        held_back.push(skill.name.clone());
+                        tally.held_back.push(skill.name.clone());
                     }
-                    Ok(_) => refreshed += 1,
-                    Err(err) => failed.push(format!("{}: {}", skill.name, err.message)),
+                    Ok(_) => tally.refreshed += 1,
+                    Err(err) => tally
+                        .failed
+                        .push(format!("{}: {}", skill.name, err.message)),
                 }
                 done += 1;
                 report(done, &skill.name, false);
@@ -2062,7 +2100,7 @@ pub fn run_update_round(
                     .err()
                     .map(|err| err.message)
                     .unwrap_or_else(|| "Skill has no usable source".to_string());
-                failed.push(format!("{}: {}", skill.name, message));
+                tally.failed.push(format!("{}: {}", skill.name, message));
             }
         }
     }
@@ -2167,31 +2205,7 @@ pub fn run_update_round(
                     &err.message,
                 );
             }
-
-            match outcome {
-                Ok(UpdateOutcome::Applied { content_changed }) => {
-                    if content_changed {
-                        refreshed += 1;
-                    } else {
-                        unchanged += 1;
-                    }
-                }
-                Ok(UpdateOutcome::Held { pending, .. }) => {
-                    held_back_paths += pending.len();
-                    held_back.push(skill.name.clone());
-                }
-                Ok(UpdateOutcome::Moved { candidates }) => {
-                    // One skill, one bucket: this arm and the two below are
-                    // alternatives, never additions, so a name can never appear
-                    // both as moved and as failed.
-                    moved_sources.push(MovedSource {
-                        name: skill.name.clone(),
-                        candidates,
-                    });
-                }
-                Ok(UpdateOutcome::Gone) => gone_sources.push(skill.name.clone()),
-                Err(err) => failed.push(format!("{}: {}", skill.name, err.message)),
-            }
+            tally.record(&skill.name, &outcome);
         }
     }
 
@@ -2201,23 +2215,17 @@ pub fn run_update_round(
     sync_metadata::write_all_from_db_unlocked(store).map_err(AppError::db)?;
 
     log::info!(
-        "update round: {refreshed} refreshed, {unchanged} unchanged, {} held back ({held_back_paths} path(s)), {} moved upstream, {} gone upstream, {} failed, cancelled={cancelled}",
-        held_back.len(),
-        moved_sources.len(),
-        gone_sources.len(),
-        failed.len()
+        "update round: {} refreshed, {} unchanged, {} held back ({} path(s)), {} moved upstream, {} gone upstream, {} failed, cancelled={cancelled}",
+        tally.refreshed,
+        tally.unchanged,
+        tally.held_back.len(),
+        tally.held_back_paths,
+        tally.moved_sources.len(),
+        tally.gone_sources.len(),
+        tally.failed.len()
     );
 
-    Ok(BatchUpdateSkillsResult {
-        refreshed,
-        unchanged,
-        failed,
-        held_back,
-        cancelled,
-        held_back_paths,
-        moved_sources,
-        gone_sources,
-    })
+    Ok(tally.into_result(cancelled))
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -4825,6 +4833,43 @@ mod tests {
         // The library copy is untouched: the round never got as far as a skill.
         let central = std::path::Path::new(&record.central_path);
         assert_eq!(fs::read_to_string(central.join("a.txt")).unwrap(), "old");
+    }
+
+    /// Medium 5: the round's four end states are alternatives, so each one
+    /// lands in its own bucket and in no other. In particular a move is not
+    /// also a refresh, and a deletion is not also a failure — the bug that
+    /// started this was one upstream rename reported as 15 failures.
+    #[test]
+    fn the_rounds_four_end_states_never_share_a_bucket() {
+        let mut tally = RoundTally::default();
+        tally.record("at", &Ok(UpdateOutcome::Applied { content_changed: true }));
+        tally.record(
+            "moved",
+            &Ok(UpdateOutcome::Moved {
+                candidates: vec![MoveCandidate {
+                    subpath: "moved-here".to_string(),
+                    confidence: Confidence::High,
+                    reason: source_membership::MoveReason::ContentHash,
+                }],
+            }),
+        );
+        tally.record("gone", &Ok(UpdateOutcome::Gone));
+        tally.record("failed", &Err(AppError::git("boom")));
+
+        let summary = tally.into_result(false);
+
+        assert_eq!(summary.refreshed, 1, "At lands in refreshed");
+        assert_eq!(summary.unchanged, 0);
+        assert!(summary.held_back.is_empty());
+        assert_eq!(summary.held_back_paths, 0);
+        assert_eq!(summary.moved_sources.len(), 1);
+        assert_eq!(summary.moved_sources[0].name, "moved");
+        assert_eq!(summary.gone_sources, vec!["gone".to_string()]);
+        assert_eq!(summary.failed, vec!["failed: boom".to_string()]);
+        // Nothing is in two places: the four names are accounted for once each.
+        assert!(!summary.failed.iter().any(|entry| entry.starts_with("moved")));
+        assert!(!summary.failed.iter().any(|entry| entry.starts_with("gone")));
+        assert!(!summary.gone_sources.iter().any(|name| name == "moved"));
     }
 
     // ── apply_prepared_update: a Source that no longer holds the recorded path ──
