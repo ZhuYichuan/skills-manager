@@ -3590,6 +3590,16 @@ fn should_skip_update_check(
     skill: &SkillRecord,
     force: bool,
 ) -> Result<bool, AppError> {
+    // `moved` and `source_gone` are answers, not revisions waiting to be
+    // compared: a check can only ask the Source about a path that no longer
+    // holds the skill, so re-diffing one would replace the answer with a
+    // verdict about the wrong directory and drop the candidates the row's
+    // button is made of. Neither TTL nor `force` has anything to add — the
+    // exits are re-pointing the source, detaching it, or deleting the skill.
+    if matches!(skill.update_status.as_str(), "moved" | "source_gone") {
+        return Ok(true);
+    }
+
     if force {
         return Ok(false);
     }
@@ -3601,11 +3611,10 @@ fn should_skip_update_check(
         .unwrap_or(60);
     let ttl_ms = ttl_minutes * 60 * 1000;
     // Statuses a TTL round must not re-check: the answer is already known and
-    // asking again cannot change it. `moved` and `source_gone` are answers, not
-    // transient states, so they settle like `up_to_date` does.
+    // asking again cannot change it within the TTL.
     let stable_status = matches!(
         skill.update_status.as_str(),
-        "up_to_date" | "update_available" | "source_missing" | "local_only" | "moved" | "source_gone"
+        "up_to_date" | "update_available" | "source_missing" | "local_only"
     );
 
     Ok(stable_status
@@ -4946,11 +4955,12 @@ mod tests {
         assert_eq!(after.last_check_error.as_deref(), Some(SOURCE_GONE_MESSAGE));
     }
 
-    /// The two answers are stable, not transient: a TTL round must not re-check
-    /// them and turn a settled move or deletion back into a failed revision
-    /// comparison. Forcing a check still asks, so the user can revisit.
+    /// The two answers are settled, not transient: no check — forced or not —
+    /// may re-diff them against the old path, because the only way out is the
+    /// user re-pointing the source or detaching it. The TTL is not the reason;
+    /// the answer is.
     #[test]
-    fn moved_and_source_gone_are_stable_for_the_ttl() {
+    fn moved_and_source_gone_are_never_rechecked() {
         let repo = test_repo();
         let dir = write_skill_dir("skill-1");
         repo.store
@@ -4964,11 +4974,67 @@ mod tests {
             let stored = repo.store.get_skill_by_id("skill-1").unwrap().unwrap();
             assert!(
                 should_skip_update_check(&repo.store, &stored, false).unwrap(),
-                "{status} should be skipped within the TTL"
+                "{status} must be skipped by a TTL round"
             );
             assert!(
-                !should_skip_update_check(&repo.store, &stored, true).unwrap(),
-                "an explicit check must still run for {status}"
+                should_skip_update_check(&repo.store, &stored, true).unwrap(),
+                "even an explicit check must leave {status} alone"
+            );
+        }
+    }
+
+    /// High 1: a check used to overwrite a settled answer — `moved` came back
+    /// as `update_available` and its candidates were deleted with it, so the
+    /// one button that fixes the row vanished on the next round. Status and
+    /// candidates both survive a check now.
+    #[test]
+    fn a_check_leaves_moved_and_source_gone_rows_alone() {
+        let repo = test_repo();
+        insert_git_skill(&repo.store, "skill-1", "https://example.test/a.git");
+        let candidates = vec![MoveCandidate {
+            subpath: "moved-here".to_string(),
+            confidence: Confidence::Low,
+            reason: source_membership::MoveReason::DirectoryName,
+        }];
+
+        // `force` is the case that used to run: it bypassed every skip, so it
+        // is the one that used to erase the answer.
+        for (status, force) in [
+            ("moved", false),
+            ("moved", true),
+            ("source_gone", false),
+            ("source_gone", true),
+        ] {
+            repo.store
+                .update_skill_check_state("skill-1", Some("old-rev"), status, None)
+                .unwrap();
+            if status == "moved" {
+                repo.store
+                    .replace_skill_move_candidates("skill-1", &candidates)
+                    .unwrap();
+            }
+
+            check_skill_update_internal_with_remote(
+                &repo.store,
+                "skill-1",
+                force,
+                prefetch("https://example.test/a.git", "new-rev"),
+            )
+            .unwrap();
+
+            let stored = repo.store.get_skill_by_id("skill-1").unwrap().unwrap();
+            assert_eq!(
+                stored.update_status, status,
+                "{status} (force={force}) must survive a check"
+            );
+            assert_eq!(
+                repo.store.get_skill_move_candidates("skill-1").unwrap(),
+                if status == "moved" {
+                    candidates.clone()
+                } else {
+                    Vec::new()
+                },
+                "{status} (force={force}) must keep exactly its own candidates"
             );
         }
     }
