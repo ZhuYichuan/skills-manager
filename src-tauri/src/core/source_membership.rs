@@ -82,8 +82,12 @@ pub struct MoveCandidate {
 }
 
 /// The three outcomes, kept separate because each leads to a different action.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "placement", rename_all = "lowercase")]
+///
+/// Deliberately not `Serialize`: the wire format the UI reads is
+/// `UpdateOutcome`'s (a status plus the candidate list), and the candidates are
+/// persisted in `skill_move_candidates`. Nothing ever sends a `Placement`, so it
+/// stays a plain value rather than growing a format nobody reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Placement {
     /// Still where the record says. Normal update path.
     At {
