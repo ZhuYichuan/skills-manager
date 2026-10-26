@@ -58,6 +58,7 @@ import type {
   SkillToolToggle,
 } from "../lib/tauri";
 import { repointChoice } from "../lib/sourceRepoint";
+import { canRefresh, isUpdateAvailable, updatableSkills } from "../lib/updateSelection";
 import { getErrorMessage } from "../lib/error";
 import { normalizeSkillSearch, skillSearchMatches } from "../lib/skillSearch";
 import {
@@ -863,12 +864,8 @@ export function MySkills() {
     relinkSource?: string;
   } | null>(null);
 
-  const handleUpdateAvailableSkills = () => {
-    const updatableSkills = skills.filter(
-      (skill) => skill.update_status === "update_available" && canRefresh(skill)
-    );
-    return runBatchUpdate(updatableSkills.map((skill) => skill.id));
-  };
+  const handleUpdateAvailableSkills = () =>
+    runBatchUpdate(updatableSkills(skills).map((skill) => skill.id));
 
   const handleTogglePreset = async (skill: ManagedSkill) => {
     if (!viewedPreset) return;
@@ -1261,22 +1258,12 @@ export function MySkills() {
     }
   };
 
-  // `moved` and `source_gone` have no update to apply: one waits for the user
-  // to re-point its source, the other has nothing left upstream. Offering
-  // "Update" for either is the failed-forever button this replaces.
-  const canRefresh = (skill: ManagedSkill) =>
-    skill.update_status !== "moved" &&
-    skill.update_status !== "source_gone" &&
-    (skill.source_type === "git" ||
-      skill.source_type === "skillssh" ||
-      ((skill.source_type === "local" || skill.source_type === "import") && !!skill.source_ref));
-
   const anyRefreshableSelected = useMemo(
     () => skills.some((skill) => selectedIds.has(skill.id) && canRefresh(skill)),
     [skills, selectedIds]
   );
   const availableUpdateCount = useMemo(
-    () => skills.filter((skill) => skill.update_status === "update_available" && canRefresh(skill)).length,
+    () => updatableSkills(skills).length,
     [skills]
   );
   const refreshableSelectedCount = useMemo(
@@ -1730,8 +1717,7 @@ export function MySkills() {
               ? skill.preset_ids.includes(viewedPreset.id)
               : false;
             const badge = statusBadge(skill);
-            const hasUpdate =
-              skill.update_status === "update_available" && canRefresh(skill);
+            const hasUpdate = isUpdateAvailable(skill);
             // The header pill is hidden in multi-select, so the body badge has to
             // take over — otherwise the update state vanishes entirely.
             const showUpdatePill = hasUpdate && !isMultiSelect;
