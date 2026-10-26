@@ -28,6 +28,7 @@ import {
   Share2,
   Tag,
   Trash2,
+  Unlink,
 } from "lucide-react";
 import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
@@ -987,7 +988,14 @@ export function MySkills() {
   const handleDetachSource = async (skill: ManagedSkill) => {
     setUpdatingSkillId(skill.id);
     try {
-      await api.detachLocalSkillSource(skill.id);
+      // Two detach paths share one action: a local skill drops its recorded
+      // source path, a Git skill drops its Source entirely and becomes local.
+      // Both keep every file.
+      if (skill.source_type === "local" || skill.source_type === "import") {
+        await api.detachLocalSkillSource(skill.id);
+      } else {
+        await api.detachSkillSource(skill.id);
+      }
       toast.success(t("mySkills.updateActions.detachedSource"));
       await refreshManagedSkills();
     } catch (error: unknown) {
@@ -1717,6 +1725,9 @@ export function MySkills() {
             const isMissingLocalSource =
               skill.update_status === "source_missing"
               && (skill.source_type === "local" || skill.source_type === "import");
+            // Gone upstream: no update and no path to re-point at, so the two
+            // exits are keeping the copy (detach) or deleting the skill.
+            const isGoneSource = skill.update_status === "source_gone";
             const displayName = skillDisplayNames.get(skill.id) || skill.name;
 
             if (viewMode === "grid") {
@@ -1817,6 +1828,15 @@ export function MySkills() {
                                   onSelect: () => handleRefreshSkill(skill),
                                 }]
                               : []),
+                            ...(isGoneSource
+                              ? [{
+                                  key: "detach",
+                                  label: t("mySkills.updateActions.detachSource"),
+                                  icon: <Unlink className="h-3.5 w-3.5" />,
+                                  disabled: updatingSkillId === skill.id,
+                                  onSelect: () => handleDetachSource(skill),
+                                }]
+                              : []),
                             {
                               key: "delete",
                               label: t("common.delete"),
@@ -1862,15 +1882,17 @@ export function MySkills() {
                             {badge.label}
                           </span>
                         )}
-                        {isMissingLocalSource && (
+                        {(isMissingLocalSource || isGoneSource) && (
                           <>
-                            <button
-                              onClick={(e) => { e.stopPropagation(); handleRelinkSource(skill); }}
-                              disabled={updatingSkillId === skill.id}
-                              className="rounded-full border border-border-subtle px-2 py-0.5 text-[12px] font-medium text-secondary transition-colors hover:bg-surface-hover disabled:opacity-50"
-                            >
-                              {t("mySkills.updateActions.relink")}
-                            </button>
+                            {isMissingLocalSource && (
+                              <button
+                                onClick={(e) => { e.stopPropagation(); handleRelinkSource(skill); }}
+                                disabled={updatingSkillId === skill.id}
+                                className="rounded-full border border-border-subtle px-2 py-0.5 text-[12px] font-medium text-secondary transition-colors hover:bg-surface-hover disabled:opacity-50"
+                              >
+                                {t("mySkills.updateActions.relink")}
+                              </button>
+                            )}
                             <button
                               onClick={(e) => { e.stopPropagation(); handleDetachSource(skill); }}
                               disabled={updatingSkillId === skill.id}
@@ -2113,15 +2135,17 @@ export function MySkills() {
                   )}
                 </div>
 
-                {isMissingLocalSource && !isMultiSelect && (
+                {(isMissingLocalSource || isGoneSource) && !isMultiSelect && (
                   <div className="flex shrink-0 items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
-                    <button
-                      onClick={(e) => { e.stopPropagation(); handleRelinkSource(skill); }}
-                      disabled={updatingSkillId === skill.id}
-                      className="rounded-md px-2 py-0.5 text-[13px] font-medium text-secondary transition-colors hover:bg-surface-hover disabled:opacity-50"
-                    >
-                      {t("mySkills.updateActions.relink")}
-                    </button>
+                    {isMissingLocalSource && (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); handleRelinkSource(skill); }}
+                        disabled={updatingSkillId === skill.id}
+                        className="rounded-md px-2 py-0.5 text-[13px] font-medium text-secondary transition-colors hover:bg-surface-hover disabled:opacity-50"
+                      >
+                        {t("mySkills.updateActions.relink")}
+                      </button>
+                    )}
                     <button
                       onClick={(e) => { e.stopPropagation(); handleDetachSource(skill); }}
                       disabled={updatingSkillId === skill.id}
@@ -2158,6 +2182,15 @@ export function MySkills() {
                               icon: <RotateCcw className={cn("h-3.5 w-3.5", updatingSkillId === skill.id && "animate-spin")} />,
                               disabled: updatingSkillId === skill.id,
                               onSelect: () => handleRefreshSkill(skill),
+                            }]
+                          : []),
+                        ...(isGoneSource
+                          ? [{
+                              key: "detach",
+                              label: t("mySkills.updateActions.detachSource"),
+                              icon: <Unlink className="h-3.5 w-3.5" />,
+                              disabled: updatingSkillId === skill.id,
+                              onSelect: () => handleDetachSource(skill),
                             }]
                           : []),
                         {

@@ -423,6 +423,15 @@ export const relinkLocalSkillSource = (
 export const detachLocalSkillSource = (skillId: string) =>
   invoke<ManagedSkill>("detach_local_skill_source", { skillId });
 
+/**
+ * Turn a Git-backed skill into a local one, keeping every file.
+ *
+ * The exit from `source_gone`: there is nothing left upstream to point at, so
+ * the library copy becomes the source of truth.
+ */
+export const detachSkillSource = (skillId: string) =>
+  invoke<ManagedSkill>("detach_skill_source", { skillId });
+
 export interface BatchImportResult {
   imported: number;
   skipped: number;

@@ -2410,6 +2410,86 @@ pub async fn detach_local_skill_source(
     .await?
 }
 
+/// Turn a Git-backed skill into an ordinary local one.
+///
+/// The counterpart of [`repoint_skill_source_internal`] for the other answer a
+/// Source can give: it no longer holds this skill anywhere, so there is nothing
+/// to re-point at and the row would otherwise wait forever. Every file stays
+/// exactly as it is — the library copy becomes the source of truth, which is
+/// what keeps hand edits made while the skill was gone.
+///
+/// Only the pointer columns change: `source_type` becomes `local`,
+/// `source_ref` the library directory itself, and the git-only fields
+/// (`source_ref_resolved`, `source_subpath`, `source_branch`,
+/// `source_revision`, `remote_revision`) are cleared so the next check hashes
+/// the source path instead of looking for a remote. The status becomes
+/// `up_to_date`: against itself, which is true and stops the badge.
+pub fn detach_skill_source_internal(
+    store: &SkillStore,
+    skill_id: &str,
+) -> Result<ManagedSkillDto, AppError> {
+    let skill = store
+        .get_skill_by_id(skill_id)
+        .map_err(AppError::db)?
+        .ok_or_else(|| AppError::not_found("Skill not found"))?;
+
+    if !is_git_channel(&skill.source_type) {
+        return Err(AppError::invalid_input(
+            "Only git-based skills can detach their source",
+        ));
+    }
+
+    {
+        let _lock = RepoLock::acquire_foreground("detach skill source").map_err(AppError::db)?;
+        store
+            .update_skill_after_reinstall(
+                &skill.id,
+                &skill.name,
+                skill.description.as_deref(),
+                "local",
+                Some(&skill.central_path),
+                None,
+                None,
+                None,
+                None,
+                None,
+                skill.content_hash.as_deref(),
+                "up_to_date",
+            )
+            .map_err(AppError::db)?;
+        // A move answer is about a Source this skill no longer has.
+        store
+            .clear_skill_move_candidates(&skill.id)
+            .map_err(AppError::db)?;
+        // Same mirror as every other pointer change: startup reindexes from it,
+        // and without this write the git pointer would come back on next launch.
+        sync_metadata::write_all_from_db_unlocked(store).map_err(AppError::db)?;
+    }
+
+    store.log_audit(
+        AuditDraft::new("detach")
+            .skill(skill.id.clone(), skill.name.clone())
+            .detail(format!(
+                "{} -> local ({})",
+                skill.source_ref.as_deref().unwrap_or("git"),
+                skill.central_path
+            ))
+            .ok(),
+    );
+
+    managed_skill_by_id(store, skill_id)
+}
+
+#[tauri::command]
+pub async fn detach_skill_source(
+    skill_id: String,
+    store: State<'_, Arc<SkillStore>>,
+) -> Result<ManagedSkillDto, AppError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || detach_skill_source_internal(&store, &skill_id))
+        .await?
+}
+
 fn managed_skill_to_dto(
     store: &SkillStore,
     skill: SkillRecord,
@@ -4953,6 +5033,84 @@ mod tests {
         assert_eq!(after.source_subpath.as_deref(), Some("skill"));
         assert_eq!(after.update_status, "source_gone");
         assert_eq!(after.last_check_error.as_deref(), Some(SOURCE_GONE_MESSAGE));
+    }
+
+    /// High 2: the other way out of `source_gone`. The user keeps the copy on
+    /// disk — including whatever they edited while it was gone — and the row
+    /// stops claiming there is a Source to update from.
+    #[test]
+    fn detaching_a_gone_skills_source_keeps_every_file() {
+        let repo = test_repo();
+        let (record, _prepared, _checkout) = prepared_fixture(
+            &repo,
+            &[("a.txt", "old")],
+            &[("a.txt", "old")],
+        );
+        let library = Path::new(&record.central_path);
+        fs::write(library.join("mine.txt"), "user work").unwrap();
+        repo.store
+            .update_skill_check_state(&record.id, Some("rev1"), "source_gone", Some(SOURCE_GONE_MESSAGE))
+            .unwrap();
+        repo.store
+            .replace_skill_move_candidates(
+                &record.id,
+                &[MoveCandidate {
+                    subpath: "somewhere".to_string(),
+                    confidence: Confidence::Low,
+                    reason: source_membership::MoveReason::DirectoryName,
+                }],
+            )
+            .unwrap();
+
+        let dto = detach_skill_source_internal(&repo.store, &record.id).unwrap();
+
+        assert_eq!(dto.source_type, "local");
+        assert_eq!(dto.source_ref.as_deref(), Some(record.central_path.as_str()));
+        assert_eq!(dto.source_ref_resolved, None);
+        assert_eq!(dto.source_subpath, None);
+        assert_eq!(dto.source_branch, None);
+        assert_eq!(dto.source_revision, None);
+        assert_eq!(dto.remote_revision, None);
+        assert_eq!(dto.update_status, "up_to_date");
+        assert_eq!(dto.last_check_error, None);
+        assert!(dto.move_candidates.is_empty(), "the move answer belonged to the old source");
+
+        // Nothing on disk was touched: detaching is a pointer change.
+        assert_eq!(fs::read_to_string(library.join("a.txt")).unwrap(), "old");
+        assert_eq!(
+            fs::read_to_string(library.join("mine.txt")).unwrap(),
+            "user work"
+        );
+        let after = repo.store.get_skill_by_id(&record.id).unwrap().unwrap();
+        assert_eq!(after.content_hash, record.content_hash);
+        assert_eq!(after.central_path, record.central_path);
+
+        // The mirror is what a restart reindexes from; a stale git pointer
+        // there would undo the change on the next launch.
+        crate::core::sync_metadata::reindex_from_metadata_unlocked(&repo.store).unwrap();
+        let reindexed = repo.store.get_skill_by_id(&record.id).unwrap().unwrap();
+        assert_eq!(reindexed.source_type, "local");
+        assert_eq!(
+            reindexed.source_ref.as_deref(),
+            Some(record.central_path.as_str())
+        );
+    }
+
+    /// Detaching a source that is already local has nothing to remove, and
+    /// saying so is clearer than silently rewriting the row.
+    #[test]
+    fn detaching_is_rejected_for_skills_without_a_git_source() {
+        let repo = test_repo();
+        let dir = write_skill_dir("skill-1");
+        repo.store
+            .insert_skill(&sample_skill("skill-1", "skill-1", &dir))
+            .unwrap();
+
+        let err = detach_skill_source_internal(&repo.store, "skill-1").unwrap_err();
+
+        assert!(err.message.contains("git-based"), "got: {}", err.message);
+        let after = repo.store.get_skill_by_id("skill-1").unwrap().unwrap();
+        assert_eq!(after.source_type, "import");
     }
 
     /// The two answers are settled, not transient: no check — forced or not —
