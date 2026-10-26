@@ -355,8 +355,26 @@ export interface BatchUpdateSkillsResult {
   cancelled: boolean;
   /** How many paths an update would have removed across the held-back skills. */
   held_back_paths: number;
-  /** Skills whose recorded path no longer exists upstream — renamed or moved. */
-  missing_sources: string[];
+  /** Skills their Source still has, but no longer at the recorded path. */
+  moved_sources: MovedSource[];
+  /** Skills their Source no longer has anywhere. */
+  gone_sources: string[];
+}
+
+/** One place a moved Skill may now live, with how sure the backend is. */
+export interface MoveCandidate {
+  /** Path inside the Source checkout, `/`-separated; empty means the root. */
+  subpath: string;
+  /** `high` means the directory's content hash equals the installed one. */
+  confidence: "high" | "low";
+  reason: "content_hash" | "directory_name" | "frontmatter_name";
+}
+
+/** A Skill whose recorded path no longer holds it, and where it could be now. */
+export interface MovedSource {
+  name: string;
+  /** Strongest first; more than one when only the name matched. */
+  candidates: MoveCandidate[];
 }
 
 export const batchUpdateSkills = (skillIds: string[]) =>

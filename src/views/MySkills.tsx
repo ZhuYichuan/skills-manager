@@ -810,13 +810,26 @@ export function MySkills() {
           })
         );
       }
-      if (result.missing_sources.length > 0) {
-        // Not a failure to retry: the Source moved or renamed these, so the
-        // advice is to re-point them.
+      if (result.moved_sources.length > 0) {
+        // Not a failure: the Source renamed or moved these, so the advice is to
+        // re-point them. The strongest candidate path rides along, because a
+        // low-confidence guess must not be presented as an answer — the user
+        // confirms the path in ticket 04 before anything is written.
+        const first = result.moved_sources[0];
         toast.warning(
-          t("mySkills.batchMissingSources", {
-            count: result.missing_sources.length,
-            names: result.missing_sources.slice(0, 3).join("、"),
+          t("mySkills.batchMovedSources", {
+            count: result.moved_sources.length,
+            names: result.moved_sources.slice(0, 3).map((moved) => moved.name).join("、"),
+            path: first.candidates[0]?.subpath ?? "",
+          })
+        );
+      }
+      if (result.gone_sources.length > 0) {
+        // Nothing left to retry: the Source deleted these outright.
+        toast.warning(
+          t("mySkills.batchGoneSources", {
+            count: result.gone_sources.length,
+            names: result.gone_sources.slice(0, 3).join("、"),
           })
         );
       }
