@@ -2828,39 +2828,24 @@ const SOURCE_GONE_MESSAGE: &str =
 /// move and a deletion identically — so all three became an update that failed
 /// forever and a retry button that could never work.
 ///
-/// A skills.sh Source names its skill by id rather than by path, so when the
-/// recorded path no longer holds it the locator is still the answer (#278);
-/// everything else stays a decision for the user, because applying an update
-/// from a guessed directory is the mistake #278 forbids.
-fn locate_update_site(
-    skill: &SkillRecord,
-    source: &RemoteRef,
-    checkout: &Path,
-) -> Result<UpdateSite, AppError> {
-    let placement = source_membership::locate(skill, checkout);
-    if let Placement::At { subpath } = &placement {
-        return Ok(UpdateSite::At(if subpath.is_empty() {
+/// The answer is `locate`'s and nothing else. A skills.sh Source names its
+/// skill by id, so its reference carries a locator that could still find a
+/// directory — but that is a name match, and `locate` already reports name
+/// matches as low-confidence candidates. Resolving it here would apply the
+/// update and rewrite `source_subpath` from a guess, while the only thing
+/// allowed to move a source pointer is the user accepting a candidate
+/// (`repoint_skill_source`). A `Moved` answer stays a question; a `Gone` one
+/// stays gone rather than being "rescued" into an update from a guess.
+fn locate_update_site(skill: &SkillRecord, checkout: &Path) -> UpdateSite {
+    match source_membership::locate(skill, checkout) {
+        Placement::At { subpath } => UpdateSite::At(if subpath.is_empty() {
             checkout.to_path_buf()
         } else {
             checkout.join(subpath)
-        }));
-    }
-
-    if source.locator.is_some() {
-        if let Ok(dir) = resolve_skill_dir(
-            checkout,
-            source.subpath.as_deref(),
-            source.locator.as_deref(),
-        ) {
-            return Ok(UpdateSite::At(dir));
-        }
-    }
-
-    Ok(match placement {
+        }),
         Placement::Moved { candidates } => UpdateSite::Moved(candidates),
-        // `At` returned above; the remaining answer is `Gone`.
-        _ => UpdateSite::Gone,
-    })
+        Placement::Gone => UpdateSite::Gone,
+    }
 }
 
 /// Install a skill from a checkout that is already on disk.
@@ -2879,7 +2864,7 @@ fn apply_prepared_update(
     let revision = &prepared.revision;
     let checkout = &prepared.checkout;
     let update_result = (|| -> Result<UpdateOutcome, AppError> {
-        let skill_dir = match locate_update_site(skill, source, checkout)? {
+        let skill_dir = match locate_update_site(skill, checkout) {
             UpdateSite::At(dir) => {
                 // Any earlier move answer is spent: this path holds the skill.
                 store
@@ -5010,6 +4995,131 @@ mod tests {
         crate::core::sync_metadata::reindex_from_metadata_unlocked(&repo.store).unwrap();
         let reindexed = repo.store.get_skill_by_id(&record.id).unwrap().unwrap();
         assert_eq!(reindexed.source_subpath.as_deref(), Some("moved-here"));
+    }
+
+    /// A skills.sh reference names its skill by id, so the record carries a
+    /// locator independent of its `source_subpath`. It is a name guess: the
+    /// locator may well find a directory, but that directory is exactly what
+    /// `locate` already reports as a candidate. Using it here would write the
+    /// guessed path into `source_subpath` without the user's decision.
+    fn skills_sh_fixture(
+        repo: &TestRepo,
+        name: &str,
+        locator: &str,
+        checkout_files: &[(&str, &str)],
+    ) -> (SkillRecord, PreparedUpdate, TempDir) {
+        const SKILL_MD: (&str, &str) = (
+            "SKILL.md",
+            "---\nname: skill-under-test\ndescription: fixture\n---\n\nbody\n",
+        );
+        let id = "skill-under-test";
+        let central_path = central_repo::skills_dir().join(id);
+        write_tree(&central_path, &[SKILL_MD, ("a.txt", "keep")]);
+        let hash = crate::core::content_hash::hash_directory(&central_path).unwrap();
+
+        let record = SkillRecord {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: None,
+            source_type: "skillssh".to_string(),
+            source_ref: Some(format!("acme/skills/{locator}")),
+            source_ref_resolved: Some("https://github.com/acme/skills.git".to_string()),
+            source_subpath: Some("skills/gone".to_string()),
+            source_branch: None,
+            source_revision: Some("rev1".to_string()),
+            remote_revision: Some("rev1".to_string()),
+            central_path: central_path.to_string_lossy().to_string(),
+            content_hash: Some(hash),
+            enabled: true,
+            created_at: 0,
+            updated_at: 0,
+            status: "ok".to_string(),
+            update_status: "update_available".to_string(),
+            last_checked_at: None,
+            last_check_error: None,
+        };
+        repo.store.upsert_skill(&record).unwrap();
+
+        // The recorded path is gone, and the skill is somewhere else now.
+        let checkout = tempdir().unwrap();
+        write_tree(checkout.path(), checkout_files);
+
+        let prepared = PreparedUpdate {
+            source: RemoteRef::from_skill(&record).unwrap(),
+            revision: "rev2".to_string(),
+            checkout: checkout.path().to_path_buf(),
+        };
+        (record, prepared, checkout)
+    }
+
+    /// Medium 4: when `locate` says the skill moved, the skills.sh locator must
+    /// not answer the question instead. Its match is the same directory, so the
+    /// only difference is that the locator would apply the update and rewrite
+    /// `source_subpath` — a re-point nobody asked for.
+    #[test]
+    fn a_move_is_not_overridden_by_the_skills_sh_locator() {
+        let repo = test_repo();
+        let (record, prepared, _checkout) = skills_sh_fixture(
+            &repo,
+            "captions-overlay",
+            "captions-overlay",
+            &[(
+                ".agents/skills/captions-overlay/SKILL.md",
+                "---
+name: captions-overlay
+---
+
+body
+",
+            )],
+        );
+        // The locator really would have found it: the directory is named after
+        // the id, which is what `find_skill_dir` matches on.
+        assert_eq!(prepared.source.locator.as_deref(), Some("captions-overlay"));
+
+        let outcome = apply_prepared_update(&repo.store, &record, &prepared, None, false).unwrap();
+
+        match outcome {
+            UpdateOutcome::Moved { candidates } => assert_eq!(
+                candidates[0].subpath, ".agents/skills/captions-overlay",
+                "the candidate `locate` found is the answer"
+            ),
+            other => panic!("a move must not become an update: {other:?}"),
+        }
+        let after = repo.store.get_skill_by_id(&record.id).unwrap().unwrap();
+        assert_eq!(
+            after.source_subpath.as_deref(),
+            Some("skills/gone"),
+            "only the user's re-point may write the path"
+        );
+    }
+
+    /// Same rule for the other answer: a locator that happens to name a
+    /// directory does not turn "gone" into a silent update from a guessed path.
+    #[test]
+    fn a_gone_skill_is_not_rescued_by_the_skills_sh_locator() {
+        let repo = test_repo();
+        let (record, prepared, _checkout) = skills_sh_fixture(
+            &repo,
+            "display-name",
+            "captions-overlay",
+            &[(
+                ".agents/skills/captions-overlay/SKILL.md",
+                "---
+name: embedded-captions
+---
+
+body
+",
+            )],
+        );
+
+        let outcome = apply_prepared_update(&repo.store, &record, &prepared, None, false).unwrap();
+
+        assert!(matches!(outcome, UpdateOutcome::Gone), "got {other:?}", other = "an update");
+        let after = repo.store.get_skill_by_id(&record.id).unwrap().unwrap();
+        assert_eq!(after.update_status, "source_gone");
+        assert_eq!(after.source_subpath.as_deref(), Some("skills/gone"));
     }
 
     /// The Source really did delete it. Counting this as a failure is what made
