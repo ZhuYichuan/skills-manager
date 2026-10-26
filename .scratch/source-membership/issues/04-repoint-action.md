@@ -4,9 +4,9 @@
 
 **Blocked by:** 03
 
-**Status:** ready-for-agent
+**Status:** done (b7f5b98)
 
-- [ ] 重指后 `central_path`、`content_hash`、库内文件均不变
-- [ ] 重指后状态回到 `update_available`（下一次检查决定）
-- [ ] 多候选必须先选再重指
-- [ ] 测试断言只改指针
+- [x] 重指后 `central_path`、`content_hash`、库内文件均不变
+- [x] 重指后状态回到 `update_available`（下一次检查决定）
+- [x] 多候选必须先选再重指
+- [x] 测试断言只改指针
