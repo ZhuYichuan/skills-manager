@@ -4,7 +4,7 @@
 
 **Blocked by:** 01–04（已全部合并）
 
-**Status:** ready-for-agent
+**Status:** done (b19e4f2, e2cfb23, bac662e, f33841d, e4dfc06, bae3a16, 2b65d11)
 
 ## High 1：下一次检查会把这些状态抹掉
 
