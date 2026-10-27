@@ -1783,7 +1783,13 @@ export function MySkills() {
                       )}
                     </div>
                     <h3
-                      className="flex-1 truncate text-[14px] font-semibold text-primary group-hover:text-accent-light"
+                      className={cn(
+                        "flex-1 truncate text-[14px] font-semibold text-primary group-hover:text-accent-light",
+                        // Gone upstream: the name is the only thing that is no
+                        // longer true about this skill. The row stays usable so
+                        // the copy can still be detached or deleted.
+                        isGoneSource && "line-through text-muted"
+                      )}
                       title={displayName}
                     >
                       {displayName}
@@ -2055,7 +2061,10 @@ export function MySkills() {
                 </div>
 
                 <h3
-                  className="w-[180px] shrink-0 truncate text-[14px] font-semibold text-secondary group-hover:text-primary"
+                  className={cn(
+                    "w-[180px] shrink-0 truncate text-[14px] font-semibold text-secondary group-hover:text-primary",
+                    isGoneSource && "line-through text-muted"
+                  )}
                   title={displayName}
                 >
                   {displayName}
