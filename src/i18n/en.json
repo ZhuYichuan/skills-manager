@@ -371,7 +371,17 @@
       "available": "Update available",
       "error": "Check failed",
       "localOnly": "Local source",
-      "sourceMissing": "Source missing"
+      "sourceMissing": "Source missing",
+      "moved": "Moved upstream",
+      "sourceGone": "Deleted upstream"
+    },
+    "move": {
+      "choosePath": "Several places match this skill. Pick the new path:"
+    },
+    "moveReason": {
+      "content_hash": "content matches the installed copy",
+      "directory_name": "directory name matches",
+      "frontmatter_name": "SKILL.md name matches"
     },
     "updateActions": {
       "check": "Check",
@@ -386,6 +396,9 @@
       "relinked": "Source path relinked",
       "detachSource": "Keep local copy",
       "detachedSource": "Source tracking removed",
+      "repoint": "Repoint source",
+      "repointed": "Source re-pointed",
+      "useThisPath": "Use this path",
       "alreadyUpToDate": "Skill content unchanged (version synced)",
       "removalTitle": "This update removes files",
       "removalMessage": "Updating {{name}} will remove {{count}} file(s) that the new version does not have. If any of them are yours, move them somewhere outside the skill folder first — nothing has changed yet.",
@@ -462,7 +475,8 @@
       "undoRemove": "Click to keep this tag"
     },
     "batchHeldBackPaths": "{{count}} not updated: the new version would delete {{paths}} file(s) ({{names}}…)",
-    "batchMissingSources": "{{count}} skills no longer exist at their recorded path — renamed or moved upstream ({{names}}…)",
+    "batchMovedSources": "{{count}} skills moved upstream ({{names}}…) — first candidate: {{path}}. Re-point them to keep updating",
+    "batchGoneSources": "{{count}} skills are gone from their Source ({{names}}…) — detach the source or delete them; retrying cannot help",
     "batchHeldBack": "{{count}} skill(s) were left alone — updating them would remove files ({{names}}). Update them one at a time to see what.",
     "batchSyncAgents": "Sync to agents ({{count}})",
     "batchSynced": "Synced {{count}} skill targets",

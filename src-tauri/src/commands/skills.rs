@@ -20,6 +20,7 @@ use crate::core::{
     scanner, scenario_service,
     skill_metadata::{self, is_valid_skill_dir},
     skill_store::{SkillRecord, SkillStore, SkillTargetRecord},
+    source_membership::{self, Confidence, MoveCandidate, Placement},
     sync_engine, sync_metadata,
     timing::should_log_first_or_slow,
     well_known,
@@ -42,6 +43,13 @@ pub struct UpdateSkillResult {
     /// remote moves on, or the skill writes another file while the dialog is
     /// open, the approval no longer matches and the user is asked again.
     pub removal_approval: Option<String>,
+    /// Where the Source says the skill went, strongest candidate first. Empty
+    /// unless the recorded path no longer holds it: the batch's `moved` bucket,
+    /// for one skill. Nothing was written — re-pointing is the user's call.
+    pub moved: Vec<MoveCandidate>,
+    /// True when the Source no longer holds this skill anywhere. Not a failure:
+    /// retrying cannot help, so the row offers detach or delete instead.
+    pub gone: bool,
 }
 
 /// Stands in for a revision when binding a re-import's approval: there is no
@@ -81,6 +89,13 @@ enum UpdateOutcome {
         pending: Vec<PendingRemoval>,
         approval: String,
     },
+    /// The recorded path no longer holds this skill, but the Source still does:
+    /// upstream renamed or moved it. Nothing was written — re-pointing the
+    /// source is the user's decision, so this carries the evidence it needs.
+    Moved { candidates: Vec<MoveCandidate> },
+    /// The Source no longer holds this skill anywhere. Not a failure: there is
+    /// nothing to retry, and the user is offered detach/delete instead.
+    Gone,
 }
 
 /// Everything a replacement would take away — from the library and from every
@@ -194,10 +209,25 @@ pub struct BatchUpdateSkillsResult {
     /// skill. The names alone do not tell the user whether it is one file or a
     /// hundred.
     pub held_back_paths: usize,
-    /// Skills whose recorded path no longer exists upstream — usually a rename
-    /// or a directory move, not a deletion. Kept apart from `failed` because the
-    /// fix is different: re-point the source, do not retry.
-    pub missing_sources: Vec<String>,
+    /// Skills whose recorded path no longer holds them, but which their Source
+    /// still contains somewhere else — a rename or a directory move. Carried
+    /// with the candidate paths and the confidence in each, because the fix is
+    /// a re-point the user has to confirm.
+    pub moved_sources: Vec<MovedSource>,
+    /// Skills their Source no longer contains anywhere. Kept apart from `failed`
+    /// because retrying cannot help: the advice is to detach the source or
+    /// delete the skill.
+    pub gone_sources: Vec<String>,
+}
+
+/// One skill that moved upstream, with every place the checkout proposes for it.
+#[derive(Debug, Serialize)]
+pub struct MovedSource {
+    pub name: String,
+    /// Strongest first (see [`source_membership::locate`]). More than one when
+    /// only the name matched, since then the module refuses to pick for the
+    /// user.
+    pub candidates: Vec<MoveCandidate>,
 }
 
 #[derive(Debug, Serialize)]
@@ -235,6 +265,10 @@ pub struct ManagedSkillDto {
     pub targets: Vec<TargetDto>,
     pub preset_ids: Vec<String>,
     pub tags: Vec<String>,
+    /// Where the last `moved` check found this skill in its Source. Empty for
+    /// every other status. Persisted so the row can still offer the one-click
+    /// re-point after a restart, when the checkout is long gone.
+    pub move_candidates: Vec<MoveCandidate>,
 }
 
 #[derive(Debug, Serialize)]
@@ -840,6 +874,8 @@ impl<'a> From<&'a UpdateOutcome> for UpdateAudit<'a> {
             UpdateOutcome::Applied { content_changed } => UpdateAudit::Applied {
                 content_changed: *content_changed,
             },
+            UpdateOutcome::Moved { candidates } => UpdateAudit::Moved { candidates },
+            UpdateOutcome::Gone => UpdateAudit::Gone,
         }
     }
 }
@@ -847,7 +883,20 @@ impl<'a> From<&'a UpdateOutcome> for UpdateAudit<'a> {
 enum UpdateAudit<'a> {
     Applied { content_changed: bool },
     Held { removed: usize },
+    /// Moved upstream; nothing was written, and the first candidate is where
+    /// the Source says it went.
+    Moved { candidates: &'a [MoveCandidate] },
+    Gone,
     Failed(&'a str),
+}
+
+/// `Confidence` in the lowercase form the audit detail uses; serde spells it the
+/// same way on the wire, so the two cannot drift.
+fn confidence_label(confidence: Confidence) -> &'static str {
+    match confidence {
+        Confidence::High => "high",
+        Confidence::Low => "low",
+    }
 }
 
 fn log_update_entry(
@@ -880,6 +929,28 @@ fn log_update_entry(
                 .skill(skill_id.to_string(), name.to_string())
                 .fail(message.to_string());
         }
+        UpdateAudit::Moved { candidates } => {
+            // Naming the first candidate is the whole point of the entry: a
+            // reader can go and look at that path instead of re-deriving it.
+            let where_to = match candidates.first() {
+                Some(first) => format!(
+                    " — first candidate '{}' ({} confidence)",
+                    first.subpath,
+                    confidence_label(first.confidence)
+                ),
+                None => String::new(),
+            };
+            draft = draft
+                .skill(skill_id.to_string(), name.to_string())
+                .detail(format!("{source_label}; moved upstream{where_to}"))
+                .ok();
+        }
+        UpdateAudit::Gone => {
+            draft = draft
+                .skill(skill_id.to_string(), name.to_string())
+                .detail(format!("{source_label}; gone upstream — no candidate in the checkout"))
+                .ok();
+        }
     }
     store.log_audit(draft);
 }
@@ -891,6 +962,13 @@ fn log_update_outcome(
     outcome: Result<&UpdateSkillResult, &AppError>,
 ) {
     let (name, entry) = match outcome {
+        Ok(result) if result.gone => (result.skill.name.clone(), UpdateAudit::Gone),
+        Ok(result) if !result.moved.is_empty() => (
+            result.skill.name.clone(),
+            UpdateAudit::Moved {
+                candidates: &result.moved,
+            },
+        ),
         Ok(result) if !result.pending_removals.is_empty() => (
             result.skill.name.clone(),
             UpdateAudit::Held {
@@ -1812,13 +1890,6 @@ pub async fn reimport_local_skill(
     .await?
 }
 
-/// Whether a failure means "this Source no longer has that directory" rather
-/// than "the network or git said no". The two need different advice: one is
-/// re-pointed, the other is retried.
-fn is_missing_source(message: &str) -> bool {
-    message.contains("does not exist in the repository")
-}
-
 /// Split a batch into one group per Source, keeping the caller's order.
 ///
 /// Skills that cannot be tied to a remote (local, imported, or a broken source
@@ -1907,6 +1978,57 @@ pub struct RoundProgress<'a> {
 /// Cancel key for the foreground batch, next to the per-skill `update:<id>`.
 pub const BATCH_UPDATE_CANCEL_KEY: &str = "update-batch";
 
+/// The round's counters, one per end state.
+///
+/// A finished skill is filed by one `match` on its outcome, so the buckets are
+/// alternatives and never additions: nothing is counted twice, and nothing
+/// recoverable by re-pointing or detaching is also counted as a failure. Kept
+/// as a value rather than a handful of loose counters so that rule is
+/// assertable without a git remote in the test.
+#[derive(Default)]
+struct RoundTally {
+    refreshed: usize,
+    unchanged: usize,
+    held_back: Vec<String>,
+    held_back_paths: usize,
+    moved_sources: Vec<MovedSource>,
+    gone_sources: Vec<String>,
+    failed: Vec<String>,
+}
+
+impl RoundTally {
+    /// File one finished skill under exactly one heading.
+    fn record(&mut self, name: &str, outcome: &Result<UpdateOutcome, AppError>) {
+        match outcome {
+            Ok(UpdateOutcome::Applied { content_changed: true }) => self.refreshed += 1,
+            Ok(UpdateOutcome::Applied { content_changed: false }) => self.unchanged += 1,
+            Ok(UpdateOutcome::Held { pending, .. }) => {
+                self.held_back_paths += pending.len();
+                self.held_back.push(name.to_string());
+            }
+            Ok(UpdateOutcome::Moved { candidates }) => self.moved_sources.push(MovedSource {
+                name: name.to_string(),
+                candidates: candidates.clone(),
+            }),
+            Ok(UpdateOutcome::Gone) => self.gone_sources.push(name.to_string()),
+            Err(err) => self.failed.push(format!("{name}: {}", err.message)),
+        }
+    }
+
+    fn into_result(self, cancelled: bool) -> BatchUpdateSkillsResult {
+        BatchUpdateSkillsResult {
+            refreshed: self.refreshed,
+            unchanged: self.unchanged,
+            failed: self.failed,
+            held_back: self.held_back,
+            cancelled,
+            held_back_paths: self.held_back_paths,
+            moved_sources: self.moved_sources,
+            gone_sources: self.gone_sources,
+        }
+    }
+}
+
 /// Update a set of skills: resoleach Source once, then fetch and apply.
 pub fn run_update_round(
     store: &SkillStore,
@@ -1916,13 +2038,8 @@ pub fn run_update_round(
     let total = skill_ids.len();
     let mut done = 0usize;
     let mut cancelled = false;
-    let mut held_back_paths = 0usize;
-    let mut missing_sources: Vec<String> = Vec::new();
-    let mut refreshed = 0usize;
-    let mut unchanged = 0usize;
+    let mut tally = RoundTally::default();
     let proxy_url = store.proxy_url();
-    let mut failed = Vec::new();
-    let mut held_back = Vec::new();
 
     // Group by Source before doing anything: a library built from a dozen
     // repositories holds many skills per repository, and every skill used to
@@ -1932,7 +2049,7 @@ pub fn run_update_round(
     for skill_id in skill_ids {
         match store.get_skill_by_id(&skill_id).map_err(AppError::db)? {
             Some(skill) => loaded.push((skill_id, skill)),
-            None => failed.push(format!("{skill_id}: Skill not found")),
+            None => tally.failed.push(format!("{skill_id}: Skill not found")),
         }
     }
     let report = |done: usize, skill: &str, started: bool| {
@@ -1950,15 +2067,7 @@ pub fn run_update_round(
 
     if is_cancelled() {
         // Stopping must not cost a round of network calls first.
-        return Ok(BatchUpdateSkillsResult {
-            refreshed,
-            unchanged,
-            failed,
-            held_back,
-            cancelled: true,
-            held_back_paths,
-            missing_sources,
-        });
+        return Ok(tally.into_result(true));
     }
 
     let (groups, ungrouped) = group_by_source(loaded);
@@ -1976,10 +2085,12 @@ pub fn run_update_round(
                 log_reimport_outcome(store, &skill_id, outcome.as_ref());
                 match outcome {
                     Ok(result) if !result.pending_removals.is_empty() => {
-                        held_back.push(skill.name.clone());
+                        tally.held_back.push(skill.name.clone());
                     }
-                    Ok(_) => refreshed += 1,
-                    Err(err) => failed.push(format!("{}: {}", skill.name, err.message)),
+                    Ok(_) => tally.refreshed += 1,
+                    Err(err) => tally
+                        .failed
+                        .push(format!("{}: {}", skill.name, err.message)),
                 }
                 done += 1;
                 report(done, &skill.name, false);
@@ -1989,7 +2100,7 @@ pub fn run_update_round(
                     .err()
                     .map(|err| err.message)
                     .unwrap_or_else(|| "Skill has no usable source".to_string());
-                failed.push(format!("{}: {}", skill.name, message));
+                tally.failed.push(format!("{}: {}", skill.name, message));
             }
         }
     }
@@ -2094,27 +2205,7 @@ pub fn run_update_round(
                     &err.message,
                 );
             }
-
-            match outcome {
-                Ok(UpdateOutcome::Applied { content_changed }) => {
-                    if content_changed {
-                        refreshed += 1;
-                    } else {
-                        unchanged += 1;
-                    }
-                }
-                Ok(UpdateOutcome::Held { pending, .. }) => {
-                    held_back_paths += pending.len();
-                    held_back.push(skill.name.clone());
-                }
-                Err(err) if is_missing_source(&err.message) => {
-                    // Already listed under missing_sources above; counting it as
-                    // a failure too told the user two different things about one
-                    // skill, and invited a retry that cannot work.
-                    missing_sources.push(skill.name.clone());
-                }
-                Err(err) => failed.push(format!("{}: {}", skill.name, err.message)),
-            }
+            tally.record(&skill.name, &outcome);
         }
     }
 
@@ -2124,21 +2215,17 @@ pub fn run_update_round(
     sync_metadata::write_all_from_db_unlocked(store).map_err(AppError::db)?;
 
     log::info!(
-        "update round: {refreshed} refreshed, {unchanged} unchanged, {} held back ({held_back_paths} path(s)), {} missing upstream, {} failed, cancelled={cancelled}",
-        held_back.len(),
-        missing_sources.len(),
-        failed.len()
+        "update round: {} refreshed, {} unchanged, {} held back ({} path(s)), {} moved upstream, {} gone upstream, {} failed, cancelled={cancelled}",
+        tally.refreshed,
+        tally.unchanged,
+        tally.held_back.len(),
+        tally.held_back_paths,
+        tally.moved_sources.len(),
+        tally.gone_sources.len(),
+        tally.failed.len()
     );
 
-    Ok(BatchUpdateSkillsResult {
-        refreshed,
-        unchanged,
-        failed,
-        held_back,
-        cancelled,
-        held_back_paths,
-        missing_sources,
-    })
+    Ok(tally.into_result(cancelled))
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -2345,6 +2432,86 @@ pub async fn detach_local_skill_source(
     .await?
 }
 
+/// Turn a Git-backed skill into an ordinary local one.
+///
+/// The counterpart of [`repoint_skill_source_internal`] for the other answer a
+/// Source can give: it no longer holds this skill anywhere, so there is nothing
+/// to re-point at and the row would otherwise wait forever. Every file stays
+/// exactly as it is — the library copy becomes the source of truth, which is
+/// what keeps hand edits made while the skill was gone.
+///
+/// Only the pointer columns change: `source_type` becomes `local`,
+/// `source_ref` the library directory itself, and the git-only fields
+/// (`source_ref_resolved`, `source_subpath`, `source_branch`,
+/// `source_revision`, `remote_revision`) are cleared so the next check hashes
+/// the source path instead of looking for a remote. The status becomes
+/// `up_to_date`: against itself, which is true and stops the badge.
+pub fn detach_skill_source_internal(
+    store: &SkillStore,
+    skill_id: &str,
+) -> Result<ManagedSkillDto, AppError> {
+    let skill = store
+        .get_skill_by_id(skill_id)
+        .map_err(AppError::db)?
+        .ok_or_else(|| AppError::not_found("Skill not found"))?;
+
+    if !is_git_channel(&skill.source_type) {
+        return Err(AppError::invalid_input(
+            "Only git-based skills can detach their source",
+        ));
+    }
+
+    {
+        let _lock = RepoLock::acquire_foreground("detach skill source").map_err(AppError::db)?;
+        store
+            .update_skill_after_reinstall(
+                &skill.id,
+                &skill.name,
+                skill.description.as_deref(),
+                "local",
+                Some(&skill.central_path),
+                None,
+                None,
+                None,
+                None,
+                None,
+                skill.content_hash.as_deref(),
+                "up_to_date",
+            )
+            .map_err(AppError::db)?;
+        // A move answer is about a Source this skill no longer has.
+        store
+            .clear_skill_move_candidates(&skill.id)
+            .map_err(AppError::db)?;
+        // Same mirror as every other pointer change: startup reindexes from it,
+        // and without this write the git pointer would come back on next launch.
+        sync_metadata::write_all_from_db_unlocked(store).map_err(AppError::db)?;
+    }
+
+    store.log_audit(
+        AuditDraft::new("detach")
+            .skill(skill.id.clone(), skill.name.clone())
+            .detail(format!(
+                "{} -> local ({})",
+                skill.source_ref.as_deref().unwrap_or("git"),
+                skill.central_path
+            ))
+            .ok(),
+    );
+
+    managed_skill_by_id(store, skill_id)
+}
+
+#[tauri::command]
+pub async fn detach_skill_source(
+    skill_id: String,
+    store: State<'_, Arc<SkillStore>>,
+) -> Result<ManagedSkillDto, AppError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || detach_skill_source_internal(&store, &skill_id))
+        .await?
+}
+
 fn managed_skill_to_dto(
     store: &SkillStore,
     skill: SkillRecord,
@@ -2367,6 +2534,7 @@ fn managed_skill_to_dto(
 
     let preset_ids = store.get_scenarios_for_skill(&skill.id).unwrap_or_default();
     let tags = tags_map.get(&skill.id).cloned().unwrap_or_default();
+    let move_candidates = store.get_skill_move_candidates(&skill.id).unwrap_or_default();
 
     // Prefer description from SKILL.md so the list view reflects edits made
     // directly on disk (file watcher emits a change event; this read serves
@@ -2399,6 +2567,7 @@ fn managed_skill_to_dto(
         targets,
         preset_ids,
         tags,
+        move_candidates,
     }
 }
 
@@ -2457,9 +2626,21 @@ pub fn update_git_skill_internal(
     let update_result = apply_prepared_update(store, &skill, &prepared, approved_removals, true);
     match update_result {
         Ok(outcome) => {
-            let (content_changed, pending_removals, removal_approval) = match outcome {
-                UpdateOutcome::Applied { content_changed } => (content_changed, Vec::new(), None),
-                UpdateOutcome::Held { pending, approval } => (false, pending, Some(approval)),
+            // A move and a deletion are answers, not errors: both left the
+            // library untouched and both ask the user for an action, so they
+            // come back as fields the caller can describe in the same words the
+            // batch uses. Only an actual failure is an `Err`.
+            let (content_changed, pending_removals, removal_approval, moved, gone) = match outcome {
+                UpdateOutcome::Applied { content_changed } => {
+                    (content_changed, Vec::new(), None, Vec::new(), false)
+                }
+                UpdateOutcome::Held { pending, approval } => {
+                    (false, pending, Some(approval), Vec::new(), false)
+                }
+                UpdateOutcome::Moved { candidates } => {
+                    (false, Vec::new(), None, candidates, false)
+                }
+                UpdateOutcome::Gone => (false, Vec::new(), None, Vec::new(), true),
             };
             let skill = managed_skill_by_id(store, skill_id)?;
             Ok(UpdateSkillResult {
@@ -2467,6 +2648,8 @@ pub fn update_git_skill_internal(
                 content_changed,
                 pending_removals,
                 removal_approval,
+                moved,
+                gone,
             })
         }
         Err(e) => {
@@ -2474,6 +2657,92 @@ pub fn update_git_skill_internal(
             Err(e)
         }
     }
+}
+
+/// Move a skill's source pointer to where the Source says it went.
+///
+/// This is deliberately the whole action: `source_subpath` is the only column
+/// written, and no skill content is copied, deleted or replaced. A rename
+/// upstream changes where the next update should fetch from, not what the user
+/// has on disk, so `central_path`, `content_hash` and every installed file stay
+/// exactly as they were; only the metadata mirror is refreshed so the pointer
+/// survives the next startup. The row returns to `update_available`: the verdict
+/// belonged to the old path, and the next check decides with the new one.
+///
+/// Keeping `source_ref_resolved` and the branch/revision is what makes this a
+/// pointer move rather than a quiet reinstall: the Source is unchanged, only the
+/// directory inside it is.
+pub fn repoint_skill_source_internal(
+    store: &SkillStore,
+    skill_id: &str,
+    subpath: &str,
+) -> Result<ManagedSkillDto, AppError> {
+    let skill = store
+        .get_skill_by_id(skill_id)
+        .map_err(AppError::db)?
+        .ok_or_else(|| AppError::not_found("Skill not found"))?;
+
+    if !is_git_channel(&skill.source_type) {
+        return Err(AppError::invalid_input(
+            "Only git-based skills can re-point their source",
+        ));
+    }
+
+    let subpath = source_membership::normalize_subpath(Some(subpath)).ok_or_else(|| {
+        AppError::invalid_input("The new source path must be relative to the repository root")
+    })?;
+    let stored_subpath = (!subpath.is_empty()).then_some(subpath.as_str());
+
+    sync_metadata::with_repo_lock("re-point skill source", || {
+        store.update_skill_source_metadata(
+            &skill.id,
+            skill.source_ref_resolved.as_deref(),
+            stored_subpath,
+            skill.source_branch.as_deref(),
+            skill.source_revision.as_deref(),
+        )?;
+        // `update_available` belongs to the new path, and clears the move
+        // candidates: their answer was about the old one. The check time is
+        // set here too, so a TTL round does not immediately re-ask.
+        store.update_skill_check_state(
+            &skill.id,
+            skill.remote_revision.as_deref(),
+            "update_available",
+            None,
+        )?;
+        // The metadata snapshot is the database's mirror and is what startup
+        // reindexes from; without this line the new pointer would be undone by
+        // the old file on the next launch. It writes no skill content — the
+        // library copy and its hash stay exactly as they were.
+        sync_metadata::ensure_skill_metadata_unlocked(store, skill_id)
+    })
+    .map_err(AppError::db)?;
+
+    store.log_audit(
+        AuditDraft::new("repoint")
+            .skill(skill.id.clone(), skill.name.clone())
+            .detail(format!(
+                "{} -> {}",
+                skill.source_subpath.as_deref().unwrap_or("."),
+                if subpath.is_empty() { "." } else { subpath.as_str() }
+            ))
+            .ok(),
+    );
+
+    managed_skill_by_id(store, skill_id)
+}
+
+#[tauri::command]
+pub async fn repoint_skill_source(
+    skill_id: String,
+    subpath: String,
+    store: State<'_, Arc<SkillStore>>,
+) -> Result<ManagedSkillDto, AppError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        repoint_skill_source_internal(&store, &skill_id, &subpath)
+    })
+    .await?
 }
 
 /// A Source's code, resolved and on disk, fetched before any lock is taken.
@@ -2543,6 +2812,50 @@ fn prepare_update(
     })
 }
 
+/// Where the checkout says this skill is, once the recorded path is no longer
+/// taken on trust.
+#[derive(Debug)]
+enum UpdateSite {
+    /// The recorded path still holds the skill. Nothing changed.
+    At(PathBuf),
+    /// Somewhere else in the same checkout, strongest candidate first.
+    Moved(Vec<MoveCandidate>),
+    /// Nowhere in this checkout.
+    Gone,
+}
+
+/// Why a Source that no longer holds a skill says so, in the row's own words.
+/// Deliberately not a failure the user can retry away.
+const SOURCE_GONE_MESSAGE: &str =
+    "The Source no longer contains this skill in any directory; retrying the update will not help";
+
+/// Ask the checkout where the skill is, instead of assuming the recorded path.
+///
+/// This replaces the bare "does `<subpath>` exist" question, whose single error
+/// answer (`Path '…' does not exist in the repository`) described a rename, a
+/// move and a deletion identically — so all three became an update that failed
+/// forever and a retry button that could never work.
+///
+/// The answer is `locate`'s and nothing else. A skills.sh Source names its
+/// skill by id, so its reference carries a locator that could still find a
+/// directory — but that is a name match, and `locate` already reports name
+/// matches as low-confidence candidates. Resolving it here would apply the
+/// update and rewrite `source_subpath` from a guess, while the only thing
+/// allowed to move a source pointer is the user accepting a candidate
+/// (`repoint_skill_source`). A `Moved` answer stays a question; a `Gone` one
+/// stays gone rather than being "rescued" into an update from a guess.
+fn locate_update_site(skill: &SkillRecord, checkout: &Path) -> UpdateSite {
+    match source_membership::locate(skill, checkout) {
+        Placement::At { subpath } => UpdateSite::At(if subpath.is_empty() {
+            checkout.to_path_buf()
+        } else {
+            checkout.join(subpath)
+        }),
+        Placement::Moved { candidates } => UpdateSite::Moved(candidates),
+        Placement::Gone => UpdateSite::Gone,
+    }
+}
+
 /// Install a skill from a checkout that is already on disk.
 ///
 /// The only step that takes the central-repo lock, and it cannot reach the
@@ -2559,11 +2872,41 @@ fn apply_prepared_update(
     let revision = &prepared.revision;
     let checkout = &prepared.checkout;
     let update_result = (|| -> Result<UpdateOutcome, AppError> {
-        let skill_dir = resolve_skill_dir(
-            &checkout,
-            source.subpath.as_deref(),
-            source.locator.as_deref(),
-        )?;
+        let skill_dir = match locate_update_site(skill, checkout) {
+            UpdateSite::At(dir) => {
+                // Any earlier move answer is spent: this path holds the skill.
+                store
+                    .clear_skill_move_candidates(&skill.id)
+                    .map_err(AppError::db)?;
+                dir
+            }
+            UpdateSite::Moved(candidates) => {
+                // Nothing to apply and nothing to fail: the update is waiting on
+                // a decision that is not this round's to make. Recording the
+                // head keeps the next check from re-diffing what this fetch
+                // just read, and clears the `updating` marker. The candidates
+                // are cached for the UI, which has to offer the button after a
+                // restart too.
+                store
+                    .update_skill_check_state(&skill.id, Some(&revision), "moved", None)
+                    .map_err(AppError::db)?;
+                store
+                    .replace_skill_move_candidates(&skill.id, &candidates)
+                    .map_err(AppError::db)?;
+                return Ok(UpdateOutcome::Moved { candidates });
+            }
+            UpdateSite::Gone => {
+                store
+                    .update_skill_check_state(
+                        &skill.id,
+                        skill.remote_revision.as_deref(),
+                        "source_gone",
+                        Some(SOURCE_GONE_MESSAGE),
+                    )
+                    .map_err(AppError::db)?;
+                return Ok(UpdateOutcome::Gone);
+            }
+        };
 
         let new_hash =
             crate::core::content_hash::hash_directory(&skill_dir).map_err(AppError::io)?;
@@ -3325,6 +3668,16 @@ fn should_skip_update_check(
     skill: &SkillRecord,
     force: bool,
 ) -> Result<bool, AppError> {
+    // `moved` and `source_gone` are answers, not revisions waiting to be
+    // compared: a check can only ask the Source about a path that no longer
+    // holds the skill, so re-diffing one would replace the answer with a
+    // verdict about the wrong directory and drop the candidates the row's
+    // button is made of. Neither TTL nor `force` has anything to add — the
+    // exits are re-pointing the source, detaching it, or deleting the skill.
+    if matches!(skill.update_status.as_str(), "moved" | "source_gone") {
+        return Ok(true);
+    }
+
     if force {
         return Ok(false);
     }
@@ -3335,9 +3688,11 @@ fn should_skip_update_check(
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(60);
     let ttl_ms = ttl_minutes * 60 * 1000;
-    let stable_status = !matches!(
+    // Statuses a TTL round must not re-check: the answer is already known and
+    // asking again cannot change it within the TTL.
+    let stable_status = matches!(
         skill.update_status.as_str(),
-        "unknown" | "checking" | "updating" | "error"
+        "up_to_date" | "update_available" | "source_missing" | "local_only"
     );
 
     Ok(stable_status
@@ -4301,14 +4656,19 @@ mod tests {
 
     /// A git skill already in the library, plus a prepared checkout shaped like
     /// one the transport would hand over.
+    ///
+    /// Both sides carry a `SKILL.md`: the checkout is scanned as a tree of real
+    /// skills, and a directory without one is not a skill directory at all — a
+    /// fixture missing it would describe something the updater never sees.
     fn prepared_fixture(
         repo: &TestRepo,
         central_files: &[(&str, &str)],
         checkout_files: &[(&str, &str)],
     ) -> (SkillRecord, PreparedUpdate, TempDir) {
+        const SKILL_MD: (&str, &str) = ("SKILL.md", "---\nname: skill-under-test\ndescription: fixture\n---\n\nbody\n");
         let id = "skill-under-test";
         let central_path = central_repo::skills_dir().join(id);
-        write_tree(&central_path, central_files);
+        write_tree(&central_path, &[&[SKILL_MD], central_files].concat());
         let hash = crate::core::content_hash::hash_directory(&central_path).unwrap();
 
         let record = SkillRecord {
@@ -4335,7 +4695,10 @@ mod tests {
         repo.store.upsert_skill(&record).unwrap();
 
         let checkout = tempdir().unwrap();
-        write_tree(&checkout.path().join("skill"), checkout_files);
+        write_tree(
+            &checkout.path().join("skill"),
+            &[&[SKILL_MD], checkout_files].concat(),
+        );
         let prepared = PreparedUpdate {
             source: RemoteRef::from_skill(&record).unwrap(),
             revision: "rev2".to_string(),
@@ -4470,6 +4833,594 @@ mod tests {
         // The library copy is untouched: the round never got as far as a skill.
         let central = std::path::Path::new(&record.central_path);
         assert_eq!(fs::read_to_string(central.join("a.txt")).unwrap(), "old");
+    }
+
+    /// Medium 5: the round's four end states are alternatives, so each one
+    /// lands in its own bucket and in no other. In particular a move is not
+    /// also a refresh, and a deletion is not also a failure — the bug that
+    /// started this was one upstream rename reported as 15 failures.
+    #[test]
+    fn the_rounds_four_end_states_never_share_a_bucket() {
+        let mut tally = RoundTally::default();
+        tally.record("at", &Ok(UpdateOutcome::Applied { content_changed: true }));
+        tally.record(
+            "moved",
+            &Ok(UpdateOutcome::Moved {
+                candidates: vec![MoveCandidate {
+                    subpath: "moved-here".to_string(),
+                    confidence: Confidence::High,
+                    reason: source_membership::MoveReason::ContentHash,
+                }],
+            }),
+        );
+        tally.record("gone", &Ok(UpdateOutcome::Gone));
+        tally.record("failed", &Err(AppError::git("boom")));
+
+        let summary = tally.into_result(false);
+
+        assert_eq!(summary.refreshed, 1, "At lands in refreshed");
+        assert_eq!(summary.unchanged, 0);
+        assert!(summary.held_back.is_empty());
+        assert_eq!(summary.held_back_paths, 0);
+        assert_eq!(summary.moved_sources.len(), 1);
+        assert_eq!(summary.moved_sources[0].name, "moved");
+        assert_eq!(summary.gone_sources, vec!["gone".to_string()]);
+        assert_eq!(summary.failed, vec!["failed: boom".to_string()]);
+        // Nothing is in two places: the four names are accounted for once each.
+        assert!(!summary.failed.iter().any(|entry| entry.starts_with("moved")));
+        assert!(!summary.failed.iter().any(|entry| entry.starts_with("gone")));
+        assert!(!summary.gone_sources.iter().any(|name| name == "moved"));
+    }
+
+    // ── apply_prepared_update: a Source that no longer holds the recorded path ──
+
+    /// Replace the checkout's fixture layout with another one, as an upstream
+    /// push would.
+    fn rewrite_checkout(checkout: &TempDir, files: &[(&str, &str)]) {
+        fs::remove_dir_all(checkout.path().join("skill")).unwrap();
+        write_tree(checkout.path(), files);
+    }
+
+    /// Upstream renamed or moved the directory: the skill is still there, and
+    /// applying the fetched tree from the old path would have failed forever.
+    #[test]
+    fn a_renamed_directory_is_reported_as_moved_with_its_candidates() {
+        let repo = test_repo();
+        let (record, prepared, checkout) = prepared_fixture(
+            &repo,
+            &[("a.txt", "old")],
+            &[("a.txt", "old")],
+        );
+        // The report's shape: `skills/<name>` became `.agents/skills/<name>`.
+        rewrite_checkout(
+            &checkout,
+            &[(
+                ".agents/skills/skill-under-test/SKILL.md",
+                "---\nname: skill-under-test\n---\n\nbody\n",
+            )],
+        );
+
+        let outcome = apply_prepared_update(&repo.store, &record, &prepared, None, false).unwrap();
+
+        match outcome {
+            UpdateOutcome::Moved { candidates } => {
+                // Only the name matched — the content hash cannot, because the
+                // new directory holds a `SKILL.md` the library copy never had.
+                assert_eq!(
+                    candidates,
+                    vec![MoveCandidate {
+                        subpath: ".agents/skills/skill-under-test".to_string(),
+                        confidence: Confidence::Low,
+                        reason: source_membership::MoveReason::DirectoryName,
+                    }]
+                );
+            }
+            other => panic!("expected a move, got {other:?}"),
+        }
+
+        // Nothing was written: re-pointing the source is the user's decision.
+        let central = std::path::Path::new(&record.central_path);
+        assert_eq!(fs::read_to_string(central.join("a.txt")).unwrap(), "old");
+        let after = repo.store.get_skill_by_id(&record.id).unwrap().unwrap();
+        assert_eq!(after.source_subpath.as_deref(), Some("skill"));
+        assert_eq!(after.source_revision.as_deref(), Some("rev1"));
+        // Waiting on that decision, not stuck at `updating` forever.
+        assert_eq!(after.update_status, "moved");
+        assert!(after.last_check_error.is_none());
+    }
+
+    /// Identical bytes elsewhere is the strong answer: the path moved, and
+    /// nothing else about the skill did.
+    #[test]
+    fn identical_content_elsewhere_is_a_high_confidence_move() {
+        let repo = test_repo();
+        let (record, prepared, checkout) = prepared_fixture(
+            &repo,
+            &[("a.txt", "same")],
+            &[("a.txt", "same")],
+        );
+        // The same tree the library holds, at a new path — `SKILL.md` included,
+        // since the content hash covers the whole directory.
+        let installed = fs::read_to_string(checkout.path().join("skill/SKILL.md")).unwrap();
+        rewrite_checkout(
+            &checkout,
+            &[
+                ("moved-here/SKILL.md", installed.as_str()),
+                ("moved-here/a.txt", "same"),
+            ],
+        );
+
+        let outcome = apply_prepared_update(&repo.store, &record, &prepared, None, false).unwrap();
+
+        match outcome {
+            UpdateOutcome::Moved { candidates } => assert_eq!(
+                candidates,
+                vec![MoveCandidate {
+                    subpath: "moved-here".to_string(),
+                    confidence: Confidence::High,
+                    reason: source_membership::MoveReason::ContentHash,
+                }]
+            ),
+            other => panic!("expected a high-confidence move, got {other:?}"),
+        }
+        let after = repo.store.get_skill_by_id(&record.id).unwrap().unwrap();
+        assert_eq!(after.source_subpath.as_deref(), Some("skill"));
+        assert_eq!(after.update_status, "moved");
+    }
+
+    /// Re-pointing is a pointer move and nothing else: the library copy — even
+    /// a file the user put there after the move was found — stays byte for
+    /// byte, and the row returns to `update_available` so the next check can
+    /// judge the new path.
+    #[test]
+    fn repointing_moves_only_the_source_pointer() {
+        let repo = test_repo();
+        let (record, prepared, checkout) = prepared_fixture(
+            &repo,
+            &[("a.txt", "same")],
+            &[("a.txt", "same")],
+        );
+        // Identical bytes at a new path, `SKILL.md` included: the high-confidence
+        // answer, and the one the UI offers as a single click.
+        let installed = fs::read_to_string(checkout.path().join("skill/SKILL.md")).unwrap();
+        rewrite_checkout(
+            &checkout,
+            &[
+                ("moved-here/SKILL.md", installed.as_str()),
+                ("moved-here/a.txt", "same"),
+            ],
+        );
+        let before = repo.store.get_skill_by_id(&record.id).unwrap().unwrap();
+        let outcome = apply_prepared_update(&repo.store, &record, &prepared, None, false).unwrap();
+        assert!(matches!(outcome, UpdateOutcome::Moved { .. }));
+
+        // The candidate must still be there when the UI comes back later; the
+        // checkout is gone by then.
+        let stored_candidates = repo.store.get_skill_move_candidates(&record.id).unwrap();
+        assert_eq!(stored_candidates.len(), 1);
+        assert_eq!(stored_candidates[0].subpath, "moved-here");
+        assert_eq!(stored_candidates[0].confidence, Confidence::High);
+
+        // Work the user did while the row sat at `moved`. Re-pointing must not
+        // consult the library at all, let alone replace it.
+        let library = Path::new(&record.central_path);
+        fs::write(library.join("mine.txt"), "user work").unwrap();
+
+        let dto = repoint_skill_source_internal(&repo.store, &record.id, "moved-here").unwrap();
+
+        assert_eq!(dto.source_subpath.as_deref(), Some("moved-here"));
+        assert_eq!(dto.update_status, "update_available");
+        assert_eq!(dto.last_check_error, None);
+        assert_eq!(dto.central_path, before.central_path);
+        assert_eq!(dto.source_ref_resolved, before.source_ref_resolved);
+        assert_eq!(dto.source_branch, before.source_branch);
+        assert_eq!(dto.source_revision, before.source_revision);
+
+        let after = repo.store.get_skill_by_id(&record.id).unwrap().unwrap();
+        assert_eq!(after.source_subpath.as_deref(), Some("moved-here"));
+        assert_eq!(after.central_path, before.central_path);
+        assert_eq!(after.content_hash, before.content_hash);
+        assert_eq!(after.source_ref_resolved, before.source_ref_resolved);
+        assert_eq!(after.source_revision, before.source_revision);
+        assert_eq!(
+            fs::read_to_string(library.join("mine.txt")).unwrap(),
+            "user work"
+        );
+        assert_eq!(fs::read_to_string(library.join("a.txt")).unwrap(), "same");
+        assert!(
+            repo.store
+                .get_skill_move_candidates(&record.id)
+                .unwrap()
+                .is_empty(),
+            "the move answer is spent once the pointer follows it"
+        );
+
+        // Startup reindexes the database from the metadata mirror. The pointer
+        // has to be there too, or the next launch quietly undoes the click.
+        crate::core::sync_metadata::reindex_from_metadata_unlocked(&repo.store).unwrap();
+        let reindexed = repo.store.get_skill_by_id(&record.id).unwrap().unwrap();
+        assert_eq!(reindexed.source_subpath.as_deref(), Some("moved-here"));
+    }
+
+    /// A skills.sh reference names its skill by id, so the record carries a
+    /// locator independent of its `source_subpath`. It is a name guess: the
+    /// locator may well find a directory, but that directory is exactly what
+    /// `locate` already reports as a candidate. Using it here would write the
+    /// guessed path into `source_subpath` without the user's decision.
+    fn skills_sh_fixture(
+        repo: &TestRepo,
+        name: &str,
+        locator: &str,
+        checkout_files: &[(&str, &str)],
+    ) -> (SkillRecord, PreparedUpdate, TempDir) {
+        const SKILL_MD: (&str, &str) = (
+            "SKILL.md",
+            "---\nname: skill-under-test\ndescription: fixture\n---\n\nbody\n",
+        );
+        let id = "skill-under-test";
+        let central_path = central_repo::skills_dir().join(id);
+        write_tree(&central_path, &[SKILL_MD, ("a.txt", "keep")]);
+        let hash = crate::core::content_hash::hash_directory(&central_path).unwrap();
+
+        let record = SkillRecord {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: None,
+            source_type: "skillssh".to_string(),
+            source_ref: Some(format!("acme/skills/{locator}")),
+            source_ref_resolved: Some("https://github.com/acme/skills.git".to_string()),
+            source_subpath: Some("skills/gone".to_string()),
+            source_branch: None,
+            source_revision: Some("rev1".to_string()),
+            remote_revision: Some("rev1".to_string()),
+            central_path: central_path.to_string_lossy().to_string(),
+            content_hash: Some(hash),
+            enabled: true,
+            created_at: 0,
+            updated_at: 0,
+            status: "ok".to_string(),
+            update_status: "update_available".to_string(),
+            last_checked_at: None,
+            last_check_error: None,
+        };
+        repo.store.upsert_skill(&record).unwrap();
+
+        // The recorded path is gone, and the skill is somewhere else now.
+        let checkout = tempdir().unwrap();
+        write_tree(checkout.path(), checkout_files);
+
+        let prepared = PreparedUpdate {
+            source: RemoteRef::from_skill(&record).unwrap(),
+            revision: "rev2".to_string(),
+            checkout: checkout.path().to_path_buf(),
+        };
+        (record, prepared, checkout)
+    }
+
+    /// Medium 4: when `locate` says the skill moved, the skills.sh locator must
+    /// not answer the question instead. Its match is the same directory, so the
+    /// only difference is that the locator would apply the update and rewrite
+    /// `source_subpath` — a re-point nobody asked for.
+    #[test]
+    fn a_move_is_not_overridden_by_the_skills_sh_locator() {
+        let repo = test_repo();
+        let (record, prepared, _checkout) = skills_sh_fixture(
+            &repo,
+            "captions-overlay",
+            "captions-overlay",
+            &[(
+                ".agents/skills/captions-overlay/SKILL.md",
+                "---
+name: captions-overlay
+---
+
+body
+",
+            )],
+        );
+        // The locator really would have found it: the directory is named after
+        // the id, which is what `find_skill_dir` matches on.
+        assert_eq!(prepared.source.locator.as_deref(), Some("captions-overlay"));
+
+        let outcome = apply_prepared_update(&repo.store, &record, &prepared, None, false).unwrap();
+
+        match outcome {
+            UpdateOutcome::Moved { candidates } => assert_eq!(
+                candidates[0].subpath, ".agents/skills/captions-overlay",
+                "the candidate `locate` found is the answer"
+            ),
+            other => panic!("a move must not become an update: {other:?}"),
+        }
+        let after = repo.store.get_skill_by_id(&record.id).unwrap().unwrap();
+        assert_eq!(
+            after.source_subpath.as_deref(),
+            Some("skills/gone"),
+            "only the user's re-point may write the path"
+        );
+    }
+
+    /// Same rule for the other answer: a locator that happens to name a
+    /// directory does not turn "gone" into a silent update from a guessed path.
+    #[test]
+    fn a_gone_skill_is_not_rescued_by_the_skills_sh_locator() {
+        let repo = test_repo();
+        let (record, prepared, _checkout) = skills_sh_fixture(
+            &repo,
+            "display-name",
+            "captions-overlay",
+            &[(
+                ".agents/skills/captions-overlay/SKILL.md",
+                "---
+name: embedded-captions
+---
+
+body
+",
+            )],
+        );
+
+        let outcome = apply_prepared_update(&repo.store, &record, &prepared, None, false).unwrap();
+
+        assert!(matches!(outcome, UpdateOutcome::Gone), "got {other:?}", other = "an update");
+        let after = repo.store.get_skill_by_id(&record.id).unwrap().unwrap();
+        assert_eq!(after.update_status, "source_gone");
+        assert_eq!(after.source_subpath.as_deref(), Some("skills/gone"));
+    }
+
+    /// The Source really did delete it. Counting this as a failure is what made
+    /// the badge impossible to clear; the round has an answer of its own.
+    #[test]
+    fn a_skill_the_source_no_longer_holds_anywhere_is_gone() {
+        let repo = test_repo();
+        let (record, prepared, checkout) = prepared_fixture(
+            &repo,
+            &[("a.txt", "keep")],
+            &[("a.txt", "keep")],
+        );
+        // An unrelated skill took the repository's only slot.
+        rewrite_checkout(
+            &checkout,
+            &[("skills/other/SKILL.md", "---\nname: other\n---\n\nbody\n")],
+        );
+
+        let outcome = apply_prepared_update(&repo.store, &record, &prepared, None, false).unwrap();
+
+        assert!(matches!(outcome, UpdateOutcome::Gone), "got {outcome:?}");
+        // The library keeps what it has; only the check state records the answer.
+        let central = std::path::Path::new(&record.central_path);
+        assert_eq!(fs::read_to_string(central.join("a.txt")).unwrap(), "keep");
+        let after = repo.store.get_skill_by_id(&record.id).unwrap().unwrap();
+        assert_eq!(after.source_subpath.as_deref(), Some("skill"));
+        assert_eq!(after.update_status, "source_gone");
+        assert_eq!(after.last_check_error.as_deref(), Some(SOURCE_GONE_MESSAGE));
+    }
+
+    /// High 2: the other way out of `source_gone`. The user keeps the copy on
+    /// disk — including whatever they edited while it was gone — and the row
+    /// stops claiming there is a Source to update from.
+    #[test]
+    fn detaching_a_gone_skills_source_keeps_every_file() {
+        let repo = test_repo();
+        let (record, _prepared, _checkout) = prepared_fixture(
+            &repo,
+            &[("a.txt", "old")],
+            &[("a.txt", "old")],
+        );
+        let library = Path::new(&record.central_path);
+        fs::write(library.join("mine.txt"), "user work").unwrap();
+        repo.store
+            .update_skill_check_state(&record.id, Some("rev1"), "source_gone", Some(SOURCE_GONE_MESSAGE))
+            .unwrap();
+        repo.store
+            .replace_skill_move_candidates(
+                &record.id,
+                &[MoveCandidate {
+                    subpath: "somewhere".to_string(),
+                    confidence: Confidence::Low,
+                    reason: source_membership::MoveReason::DirectoryName,
+                }],
+            )
+            .unwrap();
+
+        let dto = detach_skill_source_internal(&repo.store, &record.id).unwrap();
+
+        assert_eq!(dto.source_type, "local");
+        assert_eq!(dto.source_ref.as_deref(), Some(record.central_path.as_str()));
+        assert_eq!(dto.source_ref_resolved, None);
+        assert_eq!(dto.source_subpath, None);
+        assert_eq!(dto.source_branch, None);
+        assert_eq!(dto.source_revision, None);
+        assert_eq!(dto.remote_revision, None);
+        assert_eq!(dto.update_status, "up_to_date");
+        assert_eq!(dto.last_check_error, None);
+        assert!(dto.move_candidates.is_empty(), "the move answer belonged to the old source");
+
+        // Nothing on disk was touched: detaching is a pointer change.
+        assert_eq!(fs::read_to_string(library.join("a.txt")).unwrap(), "old");
+        assert_eq!(
+            fs::read_to_string(library.join("mine.txt")).unwrap(),
+            "user work"
+        );
+        let after = repo.store.get_skill_by_id(&record.id).unwrap().unwrap();
+        assert_eq!(after.content_hash, record.content_hash);
+        assert_eq!(after.central_path, record.central_path);
+
+        // The mirror is what a restart reindexes from; a stale git pointer
+        // there would undo the change on the next launch.
+        crate::core::sync_metadata::reindex_from_metadata_unlocked(&repo.store).unwrap();
+        let reindexed = repo.store.get_skill_by_id(&record.id).unwrap().unwrap();
+        assert_eq!(reindexed.source_type, "local");
+        assert_eq!(
+            reindexed.source_ref.as_deref(),
+            Some(record.central_path.as_str())
+        );
+    }
+
+    /// Detaching a source that is already local has nothing to remove, and
+    /// saying so is clearer than silently rewriting the row.
+    #[test]
+    fn detaching_is_rejected_for_skills_without_a_git_source() {
+        let repo = test_repo();
+        let dir = write_skill_dir("skill-1");
+        repo.store
+            .insert_skill(&sample_skill("skill-1", "skill-1", &dir))
+            .unwrap();
+
+        let err = detach_skill_source_internal(&repo.store, "skill-1").unwrap_err();
+
+        assert!(err.message.contains("git-based"), "got: {}", err.message);
+        let after = repo.store.get_skill_by_id("skill-1").unwrap().unwrap();
+        assert_eq!(after.source_type, "import");
+    }
+
+    /// The two answers are settled, not transient: no check — forced or not —
+    /// may re-diff them against the old path, because the only way out is the
+    /// user re-pointing the source or detaching it. The TTL is not the reason;
+    /// the answer is.
+    #[test]
+    fn moved_and_source_gone_are_never_rechecked() {
+        let repo = test_repo();
+        let dir = write_skill_dir("skill-1");
+        repo.store
+            .insert_skill(&sample_skill("skill-1", "skill-1", &dir))
+            .unwrap();
+
+        for status in ["moved", "source_gone"] {
+            repo.store
+                .update_skill_check_state("skill-1", Some("rev"), status, None)
+                .unwrap();
+            let stored = repo.store.get_skill_by_id("skill-1").unwrap().unwrap();
+            assert!(
+                should_skip_update_check(&repo.store, &stored, false).unwrap(),
+                "{status} must be skipped by a TTL round"
+            );
+            assert!(
+                should_skip_update_check(&repo.store, &stored, true).unwrap(),
+                "even an explicit check must leave {status} alone"
+            );
+        }
+    }
+
+    /// High 1: a check used to overwrite a settled answer — `moved` came back
+    /// as `update_available` and its candidates were deleted with it, so the
+    /// one button that fixes the row vanished on the next round. Status and
+    /// candidates both survive a check now.
+    #[test]
+    fn a_check_leaves_moved_and_source_gone_rows_alone() {
+        let repo = test_repo();
+        insert_git_skill(&repo.store, "skill-1", "https://example.test/a.git");
+        let candidates = vec![MoveCandidate {
+            subpath: "moved-here".to_string(),
+            confidence: Confidence::Low,
+            reason: source_membership::MoveReason::DirectoryName,
+        }];
+
+        // `force` is the case that used to run: it bypassed every skip, so it
+        // is the one that used to erase the answer.
+        for (status, force) in [
+            ("moved", false),
+            ("moved", true),
+            ("source_gone", false),
+            ("source_gone", true),
+        ] {
+            repo.store
+                .update_skill_check_state("skill-1", Some("old-rev"), status, None)
+                .unwrap();
+            if status == "moved" {
+                repo.store
+                    .replace_skill_move_candidates("skill-1", &candidates)
+                    .unwrap();
+            }
+
+            check_skill_update_internal_with_remote(
+                &repo.store,
+                "skill-1",
+                force,
+                prefetch("https://example.test/a.git", "new-rev"),
+            )
+            .unwrap();
+
+            let stored = repo.store.get_skill_by_id("skill-1").unwrap().unwrap();
+            assert_eq!(
+                stored.update_status, status,
+                "{status} (force={force}) must survive a check"
+            );
+            assert_eq!(
+                repo.store.get_skill_move_candidates("skill-1").unwrap(),
+                if status == "moved" {
+                    candidates.clone()
+                } else {
+                    Vec::new()
+                },
+                "{status} (force={force}) must keep exactly its own candidates"
+            );
+        }
+    }
+
+    /// Medium 3: one skill at a time reaches the same audit vocabulary as a
+    /// batch. A move and a deletion are answers — a `Failed` entry would show
+    /// the skill as "check failed" in the history and invite a retry that
+    /// cannot work.
+    #[test]
+    fn a_single_skills_move_and_deletion_are_audited_as_answers() {
+        let repo = test_repo();
+        let dir = write_skill_dir("skill-1");
+        repo.store
+            .insert_skill(&sample_skill("skill-1", "skill-1", &dir))
+            .unwrap();
+        let candidates = vec![MoveCandidate {
+            subpath: "moved-here".to_string(),
+            confidence: Confidence::High,
+            reason: source_membership::MoveReason::ContentHash,
+        }];
+
+        log_update_outcome(
+            &repo.store,
+            "skill-1",
+            "git",
+            Ok(&UpdateSkillResult {
+                skill: managed_skill_by_id(&repo.store, "skill-1").unwrap(),
+                content_changed: false,
+                pending_removals: Vec::new(),
+                removal_approval: None,
+                moved: candidates,
+                gone: false,
+            }),
+        );
+        log_update_outcome(
+            &repo.store,
+            "skill-1",
+            "git",
+            Ok(&UpdateSkillResult {
+                skill: managed_skill_by_id(&repo.store, "skill-1").unwrap(),
+                content_changed: false,
+                pending_removals: Vec::new(),
+                removal_approval: None,
+                moved: Vec::new(),
+                gone: true,
+            }),
+        );
+
+        let entries = repo.store.list_audit(None).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries.iter().all(|entry| entry.success),
+            "neither answer is a failure"
+        );
+        assert!(
+            entries[0].detail.as_deref().unwrap_or("").contains("gone upstream"),
+            "got: {:?}",
+            entries[0].detail
+        );
+        assert!(
+            entries[1]
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("moved upstream — first candidate 'moved-here'"),
+            "got: {:?}",
+            entries[1].detail
+        );
     }
 
     // ── RemoteIdentity dedup (batch check_all fan-out) ──
