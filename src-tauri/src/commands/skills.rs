@@ -19,7 +19,7 @@ use crate::core::{
     repo_lock::RepoLock,
     scanner, scenario_service,
     skill_metadata::{self, is_valid_skill_dir},
-    skill_store::{SkillRecord, SkillStore, SkillTargetRecord},
+    skill_store::{PendingRemovalRecord, SkillRecord, SkillStore, SkillTargetRecord},
     source_membership::{self, Confidence, MoveCandidate, Placement},
     sync_engine, sync_metadata,
     timing::should_log_first_or_slow,
@@ -78,6 +78,53 @@ pub struct PendingRemoval {
 /// `PendingRemoval::location` for the central library, as opposed to an agent's
 /// deployed copy.
 pub const LIBRARY_LOCATION: &str = "library";
+
+/// One skill's removals in one place: the library, or a single agent copy.
+///
+/// A skill can appear in more than one group, because approving is per skill
+/// while the paths it would delete may live in several directories. The panel
+/// shows that split; the token still covers the whole skill.
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingRemovalGroup {
+    pub skill_id: String,
+    pub skill_name: String,
+    /// The Source the skill came from, in the form `source_ref_resolved` stores.
+    pub source: String,
+    /// The revision the stored list describes, and the first half of its token.
+    pub revision: String,
+    /// [`LIBRARY_LOCATION`], or the key of the agent whose copy holds it.
+    pub location: String,
+    pub paths: Vec<String>,
+}
+
+/// One skill whose approval did not go through. Other skills in the same batch
+/// are unaffected: removals are per-skill, not a transaction across skills.
+#[derive(Debug, Serialize)]
+pub struct FailedRemoval {
+    pub name: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApproveRemovalsResult {
+    pub approved: usize,
+    pub failed: Vec<FailedRemoval>,
+}
+
+/// What one skill's approval attempt means for the batch.
+enum ApprovalOutcome {
+    Applied,
+    /// The list or revision differs from the stored question. The update has
+    /// written the new list, so the panel must show it before another approval.
+    ListChanged,
+    /// A move or deletion upstream: approving removals is not the right action.
+    CannotApply(String),
+}
+
+/// Stored rather than translated: the panel refreshes itself after this, and the
+/// message is only a last-resort description for logs and API callers.
+const PENDING_REMOVALS_CHANGED_MESSAGE: &str =
+    "The removals changed since they were listed; review the updated list before approving";
 
 #[derive(Debug)]
 enum UpdateOutcome {
@@ -218,6 +265,9 @@ pub struct BatchUpdateSkillsResult {
     /// because retrying cannot help: the advice is to detach the source or
     /// delete the skill.
     pub gone_sources: Vec<String>,
+    /// Skills the Sources gained that the library does not hold. Offered by the
+    /// UI; never installed by the round.
+    pub new_skills: Vec<NewSkill>,
 }
 
 /// One skill that moved upstream, with every place the checkout proposes for it.
@@ -862,6 +912,22 @@ fn record_update_failure(
     let _ = store.update_skill_check_state(skill_id, revision, "error", Some(message));
 }
 
+/// Drop a held removal list for a skill that just ended anywhere else.
+///
+/// A list is a description of one held state; once the skill is applied, moved,
+/// gone or failed, that description is stale and must not outlive it. The
+/// round and the single-skill error path both call this so the rule has one
+/// definition. A failed cleanup is logged, not promoted to a skill failure:
+/// the update itself already has an answer.
+fn clear_stale_pending_removals(store: &SkillStore, skill_id: &str) {
+    if let Err(err) = store.clear_skill_pending_removals(skill_id) {
+        log::warn!(
+            "could not clear pending removals for {skill_id}: {}",
+            err
+        );
+    }
+}
+
 /// What an update did, as the audit trail records it. Both the single-skill and
 /// the batch path end here, so the two cannot describe the same outcome
 /// differently.
@@ -1245,6 +1311,95 @@ pub async fn install_git(
 
         emit_progress("done");
         Ok(())
+    })
+    .await?
+}
+
+/// Build the reference for a skill the round discovered, without a tree URL.
+///
+/// A tree URL has to guess which segment is the branch and is only understood
+/// for GitHub-shaped URLs. The round already knows the Source, the branch and
+/// the subpath as separate values, so no parsing is needed — and a Source with
+/// no branch stays `None` instead of being handed the first path segment as a
+/// branch name.
+fn new_skill_source(
+    source_ref_resolved: &str,
+    branch: Option<&str>,
+    subpath: &str,
+) -> Result<RemoteRef, AppError> {
+    git_fetcher::validate_git_url(source_ref_resolved).map_err(AppError::git)?;
+    Ok(RemoteRef {
+        original_url: source_ref_resolved.to_string(),
+        clone_url: source_ref_resolved.to_string(),
+        branch: branch.filter(|branch| !branch.is_empty()).map(str::to_string),
+        subpath: source_membership::normalize_subpath(Some(subpath))
+            .filter(|subpath| !subpath.is_empty()),
+        locator: None,
+    })
+}
+
+/// Install one skill a round discovered, from the Source it came from.
+///
+/// Deliberately not routed through `install_git` with a tree URL: the round
+/// already holds the three values separately, and a branch-less Source or a
+/// GitLab/ssh URL does not survive that string form.
+///
+/// The round has just fetched this Source, so the cache is warm. `Reuse` takes
+/// that copy and only clones when the cache has gone; the fallback is the
+/// ordinary narrow clone.
+#[tauri::command]
+pub async fn install_new_skill(
+    source_ref_resolved: String,
+    branch: Option<String>,
+    subpath: String,
+    store: State<'_, Arc<SkillStore>>,
+    cancel_registry: State<'_, Arc<InstallCancelRegistry>>,
+) -> Result<(), AppError> {
+    let store = store.inner().clone();
+    let proxy_url = store.proxy_url();
+    let registry = cancel_registry.inner().clone();
+    let cancel_key = format!(
+        "install-new:{source_ref_resolved}#{}#{subpath}",
+        branch.as_deref().unwrap_or("")
+    );
+    let cancel = registry.register(&cancel_key);
+    let _cancel_guard = CancelRegistrationGuard::new(registry, cancel_key);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let source = new_skill_source(&source_ref_resolved, branch.as_deref(), &subpath)?;
+        let temp_dir = git_fetcher::clone_repo_ref_scoped_with(
+            &source.clone_url,
+            source.branch.as_deref(),
+            source.subpath.as_deref(),
+            Some(&cancel),
+            proxy_url.as_deref(),
+            None,
+            git_fetcher::CacheRefresh::Reuse,
+        )
+        .map_err(AppError::classify_git_error)?;
+
+        let install_result = (|| -> Result<(), AppError> {
+            let _lock =
+                RepoLock::acquire_foreground("install discovered skill").map_err(AppError::db)?;
+            let skill_dir = resolve_skill_dir(&temp_dir, source.subpath.as_deref(), None)?;
+            let revision = git_fetcher::get_head_revision(&temp_dir).map_err(AppError::git)?;
+            let result = installer::install_from_git_dir(&skill_dir, None).map_err(AppError::io)?;
+            let metadata = InstallSourceMetadata {
+                source_type: "git".to_string(),
+                source_ref: Some(source.original_url.clone()),
+                source_ref_resolved: Some(source.clone_url.clone()),
+                source_subpath: git_fetcher::relative_subpath(&temp_dir, &skill_dir),
+                source_branch: source.branch.clone(),
+                source_revision: Some(revision.clone()),
+                remote_revision: Some(revision),
+                update_status: "up_to_date".to_string(),
+            };
+            store_installed_skill_unlocked(&store, &result, &metadata, None)?;
+            Ok(())
+        })();
+
+        git_fetcher::cleanup_temp(&temp_dir);
+        install_result
     })
     .await?
 }
@@ -1890,6 +2045,149 @@ pub async fn reimport_local_skill(
     .await?
 }
 
+/// Settings key holding the new skills the user has said no to, oldest first.
+/// A prompt that returns every round is a prompt the user learns to dismiss
+/// without reading.
+const DISMISSED_NEW_SKILLS: &str = "dismissed_new_skills";
+
+/// Upper bound on the refusal list.
+///
+/// Pruning to "keys still in this round's trees" would forget every Source the
+/// round did not visit, and a skill upstream deleted today can reappear. A
+/// bounded oldest-first list keeps the record from growing forever while
+/// forgetting only what the user has not been asked about in a long time.
+const MAX_DISMISSED_NEW_SKILLS: usize = 500;
+
+fn dismissed_new_skills(store: &SkillStore) -> Vec<String> {
+    store
+        .get_setting(DISMISSED_NEW_SKILLS)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// Remember the refusals so the next round does not ask again.
+fn remember_dismissed_new_skills(
+    store: &SkillStore,
+    keys: Vec<String>,
+) -> Result<(), AppError> {
+    let mut current = dismissed_new_skills(store);
+    let before = current.len();
+    for key in keys {
+        if !current.contains(&key) {
+            current.push(key);
+        }
+    }
+    if current.len() == before {
+        return Ok(());
+    }
+    if current.len() > MAX_DISMISSED_NEW_SKILLS {
+        let overflow = current.len() - MAX_DISMISSED_NEW_SKILLS;
+        current.drain(..overflow);
+    }
+    store
+        .set_setting(
+            DISMISSED_NEW_SKILLS,
+            &serde_json::to_string(&current).unwrap_or_default(),
+        )
+        .map_err(AppError::db)
+}
+
+/// Stable key for a discovered skill: the Source's identity (which folds `.git`
+/// and a trailing slash, and carries the branch) plus the name in lower case.
+/// Name rather than subpath, because one repository shipping the same skill in
+/// two trees is one prompt; the frontend copies this key and never builds one.
+fn new_skill_key(source: &RemoteIdentity, name: &str) -> String {
+    format!("{}#{}", source.key(), name.trim().to_lowercase())
+}
+
+/// Every subpath the library already holds, per Source. Read once per round
+/// rather than once per group: the scan needs the whole Source's inventory to
+/// tell a new skill from an installed one.
+///
+/// Keyed by [`RemoteIdentity`], not by the URL string: `.git`, a trailing slash
+/// and the branch are part of the question, and comparing URLs by spelling is
+/// how an installed skill came back as new and overwrote itself on install.
+fn installed_subpaths_by_source(
+    store: &SkillStore,
+) -> Result<HashMap<RemoteIdentity, Vec<String>>, AppError> {
+    let mut out: HashMap<RemoteIdentity, Vec<String>> = HashMap::new();
+    for skill in store.get_all_skills().map_err(AppError::db)? {
+        let Some(subpath) = skill.source_subpath.as_deref() else {
+            continue;
+        };
+        let Ok(source) = RemoteRef::from_skill(&skill) else {
+            continue;
+        };
+        let Some(subpath) = source_membership::normalize_subpath(Some(subpath)) else {
+            continue;
+        };
+        out.entry(source.identity()).or_default().push(subpath);
+    }
+    Ok(out)
+}
+
+/// The skills this checkout holds that the library does not, minus the ones
+/// this round already answered a different way.
+///
+/// A member `locate` reports as `Moved` contributes its candidate subpaths to
+/// the exclusion set. Without that, a rename arrives twice in one round — as a
+/// move and as a new skill — and installing the second would rewrite the
+/// existing record's `source_subpath`, which only the user may do.
+///
+/// `seen` deduplicates across groups: one name from one Source is one prompt,
+/// even if two checkouts of it are scanned.
+fn collect_new_skills(
+    source: &RemoteRef,
+    checkout: &Path,
+    members: &[(String, SkillRecord)],
+    known_subpaths: &[String],
+    dismissed: &HashSet<String>,
+    seen: &mut HashSet<(RemoteIdentity, String)>,
+) -> Vec<NewSkill> {
+    let mut moved_to: HashSet<String> = HashSet::new();
+    for (_, skill) in members {
+        if let Placement::Moved { candidates } = source_membership::locate(skill, checkout) {
+            moved_to.extend(candidates.into_iter().map(|candidate| candidate.subpath));
+        }
+    }
+
+    let identity = source.identity();
+    let mut found = Vec::new();
+    for skill in source_membership::discover(checkout, known_subpaths) {
+        if moved_to.contains(&skill.subpath)
+            || skill.also_at.iter().any(|path| moved_to.contains(path))
+        {
+            continue;
+        }
+        let key = new_skill_key(&identity, &skill.name);
+        if dismissed.contains(&key) {
+            continue;
+        }
+        if !seen.insert((identity.clone(), skill.name.to_lowercase())) {
+            continue;
+        }
+        found.push(NewSkill {
+            name: skill.name,
+            subpath: skill.subpath,
+            source_ref_resolved: source.clone_url.clone(),
+            branch: source.branch.clone(),
+            key,
+        });
+    }
+    found
+}
+
+/// Stop offering these skills. The round filters them out from then on.
+#[tauri::command]
+pub fn dismiss_new_skills(
+    keys: Vec<String>,
+    store: State<'_, Arc<SkillStore>>,
+) -> Result<(), AppError> {
+    remember_dismissed_new_skills(store.inner(), keys)
+}
+
 /// Split a batch into one group per Source, keeping the caller's order.
 ///
 /// Skills that cannot be tied to a remote (local, imported, or a broken source
@@ -1993,6 +2291,7 @@ struct RoundTally {
     held_back_paths: usize,
     moved_sources: Vec<MovedSource>,
     gone_sources: Vec<String>,
+    new_skills: Vec<NewSkill>,
     failed: Vec<String>,
 }
 
@@ -2025,6 +2324,7 @@ impl RoundTally {
             held_back_paths: self.held_back_paths,
             moved_sources: self.moved_sources,
             gone_sources: self.gone_sources,
+            new_skills: self.new_skills,
         }
     }
 }
@@ -2070,6 +2370,22 @@ pub fn run_update_round(
         return Ok(tally.into_result(true));
     }
 
+    // A library read that fails means every stored subpath is unknown, which
+    // would present the whole library as new. Skip discovery for the round
+    // instead: the update itself does not depend on it.
+    let installed = match installed_subpaths_by_source(store) {
+        Ok(installed) => Some(installed),
+        Err(error) => {
+            log::warn!(
+                "skipping new-skill discovery: cannot read the library: {}",
+                error.message
+            );
+            None
+        }
+    };
+    let dismissed: HashSet<String> = dismissed_new_skills(store).into_iter().collect();
+    let mut seen_new_skills: HashSet<(RemoteIdentity, String)> = HashSet::new();
+
     let (groups, ungrouped) = group_by_source(loaded);
     // Local and imported sources share nothing and have no remote to
     // resolve, so they keep re-importing one at a time, as they always did.
@@ -2084,13 +2400,18 @@ pub fn run_update_round(
                 let outcome = reimport_local_skill_internal(store, &skill_id, None);
                 log_reimport_outcome(store, &skill_id, outcome.as_ref());
                 match outcome {
-                    Ok(result) if !result.pending_removals.is_empty() => {
+                    Ok(ref result) if !result.pending_removals.is_empty() => {
                         tally.held_back.push(skill.name.clone());
                     }
                     Ok(_) => tally.refreshed += 1,
-                    Err(err) => tally
+                    Err(ref err) => tally
                         .failed
-                        .push(format!("{}: {}", skill.name, err.message)),
+                        .push(format!("{}: {}", skill.name, &err.message)),
+                }
+                // Re-import approvals are not stored in the table, so any rows
+                // this skill had from an older Git attempt are stale here too.
+                if !matches!(&outcome, Ok(result) if !result.pending_removals.is_empty()) {
+                    clear_stale_pending_removals(store, &skill_id);
                 }
                 done += 1;
                 report(done, &skill.name, false);
@@ -2137,6 +2458,7 @@ pub fn run_update_round(
         // The first checkout of a Source is where the revision comes from;
         // every later one reuses it rather than asking the remote again.
         let mut head: Option<String> = None;
+        let mut scanned: Option<std::path::PathBuf> = None;
         for at in refreshing {
             let (skill_id, skill) = &members[at];
             let outcome = prepare_update(
@@ -2149,6 +2471,9 @@ pub fn run_update_round(
             );
             if let Ok(prepared_update) = &outcome {
                 head = Some(prepared_update.revision.clone());
+                if scanned.is_none() {
+                    scanned = Some(prepared_update.checkout.clone());
+                }
             }
             prepared[at] = Some(outcome);
         }
@@ -2171,6 +2496,27 @@ pub fn run_update_round(
             );
             for (at, outcome) in fetched {
                 prepared[at] = Some(outcome);
+            }
+        }
+
+        // The checkout is on disk for the length of this group: the cheapest
+        // moment there will ever be to see which skills the Source gained.
+        if let (Some(checkout), Some(installed)) = (&scanned, &installed) {
+            if let Some((_, any_member)) = members.first() {
+                if let Ok(source) = RemoteRef::from_skill(any_member) {
+                    let known_subpaths = installed
+                        .get(&source.identity())
+                        .cloned()
+                        .unwrap_or_default();
+                    tally.new_skills.extend(collect_new_skills(
+                        &source,
+                        checkout,
+                        &members,
+                        &known_subpaths,
+                        &dismissed,
+                        &mut seen_new_skills,
+                    ));
+                }
             }
         }
 
@@ -2206,6 +2552,9 @@ pub fn run_update_round(
                 );
             }
             tally.record(&skill.name, &outcome);
+            if !matches!(&outcome, Ok(UpdateOutcome::Held { .. })) {
+                clear_stale_pending_removals(store, skill_id);
+            }
         }
     }
 
@@ -2479,9 +2828,13 @@ pub fn detach_skill_source_internal(
                 "up_to_date",
             )
             .map_err(AppError::db)?;
-        // A move answer is about a Source this skill no longer has.
+        // A move answer and a held removal list are about a Source this skill
+        // no longer has.
         store
             .clear_skill_move_candidates(&skill.id)
+            .map_err(AppError::db)?;
+        store
+            .clear_skill_pending_removals(&skill.id)
             .map_err(AppError::db)?;
         // Same mirror as every other pointer change: startup reindexes from it,
         // and without this write the git pointer would come back on next launch.
@@ -2613,14 +2966,21 @@ pub fn update_git_skill_internal(
     }
 
     let transport = remote_batch::GitTransport::with_cancel(proxy_url.map(str::to_string), cancel);
-    let prepared = prepare_update(
+    let prepared = match prepare_update(
         store,
         skill.id.as_str(),
         &skill,
         &transport,
         git_fetcher::CacheRefresh::Fetch,
         None,
-    )?;
+    ) {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            // No held answer is true any more once the check itself failed.
+            clear_stale_pending_removals(store, &skill.id);
+            return Err(err);
+        }
+    };
     // Applying is the only part that takes the central-repo lock, and it never
     // reaches the network: the checkout is already on disk.
     let update_result = apply_prepared_update(store, &skill, &prepared, approved_removals, true);
@@ -2654,9 +3014,163 @@ pub fn update_git_skill_internal(
         }
         Err(e) => {
             record_update_failure(store, skill_id, Some(&prepared.revision), &e.message);
+            clear_stale_pending_removals(store, skill_id);
             Err(e)
         }
     }
+}
+
+/// The stored removals, grouped per skill and location, ready for the panel.
+///
+/// The store returns one row per path because that is what the token covers;
+/// the interface wants contiguous groups, and the library must come first
+/// within a skill so the most likely place to rescue a file reads first.
+fn pending_removal_groups(store: &SkillStore) -> Result<Vec<PendingRemovalGroup>, AppError> {
+    let rows = store.list_pending_removals().map_err(AppError::db)?;
+    let mut groups: Vec<PendingRemovalGroup> = Vec::new();
+    for row in rows {
+        let same_group = groups.last().is_some_and(|group| {
+            group.skill_id == row.skill_id && group.location == row.location
+        });
+        if same_group {
+            groups
+                .last_mut()
+                .expect("checked above")
+                .paths
+                .push(row.path);
+            continue;
+        }
+        groups.push(PendingRemovalGroup {
+            skill_id: row.skill_id,
+            skill_name: row.skill_name,
+            source: row.source,
+            revision: row.revision,
+            location: row.location,
+            paths: vec![row.path],
+        });
+    }
+    Ok(groups)
+}
+
+/// Approve the stored question for each skill, one at a time.
+///
+/// `update_one` is the existing single-skill update path: this function never
+/// removes anything itself, so an approval cannot grow into a bypass. It is a
+/// seam only so tests can drive the same loop without a git remote.
+///
+/// No cross-skill transaction: eight successes and two failures are reported as
+/// exactly that. Removal is a per-skill act, and rolling back files after they
+/// are gone is not something a transaction can do.
+fn approve_pending_removals_with<F>(
+    store: &SkillStore,
+    skill_ids: Vec<String>,
+    mut update_one: F,
+) -> Result<ApproveRemovalsResult, AppError>
+where
+    F: FnMut(&SkillStore, &str, &str) -> Result<ApprovalOutcome, AppError>,
+{
+    let mut approved = 0usize;
+    let mut failed = Vec::new();
+
+    for skill_id in skill_ids {
+        let skill = store.get_skill_by_id(&skill_id).map_err(AppError::db)?;
+        let name = skill
+            .as_ref()
+            .map(|skill| skill.name.clone())
+            .unwrap_or_else(|| skill_id.clone());
+
+        let Some(stored) = store
+            .get_skill_pending_removals(&skill_id)
+            .map_err(AppError::db)?
+        else {
+            failed.push(FailedRemoval {
+                name,
+                message: "No pending removals to approve".to_string(),
+            });
+            continue;
+        };
+        if skill.is_none() {
+            failed.push(FailedRemoval {
+                name,
+                message: "Skill not found".to_string(),
+            });
+            continue;
+        }
+
+        match update_one(store, &skill_id, &stored.approval) {
+            Ok(ApprovalOutcome::Applied) => approved += 1,
+            Ok(ApprovalOutcome::ListChanged) => failed.push(FailedRemoval {
+                name,
+                message: PENDING_REMOVALS_CHANGED_MESSAGE.to_string(),
+            }),
+            Ok(ApprovalOutcome::CannotApply(message)) => {
+                failed.push(FailedRemoval { name, message })
+            }
+            Err(err) => failed.push(FailedRemoval {
+                name,
+                message: err.message,
+            }),
+        }
+    }
+
+    Ok(ApproveRemovalsResult { approved, failed })
+}
+
+fn approve_removals_internal(
+    store: &SkillStore,
+    skill_ids: Vec<String>,
+) -> Result<ApproveRemovalsResult, AppError> {
+    let proxy_url = store.proxy_url();
+    approve_pending_removals_with(store, skill_ids, |store, skill_id, approval| {
+        let outcome = update_git_skill_internal(
+            store,
+            skill_id,
+            proxy_url.as_deref(),
+            None,
+            Some(approval),
+        );
+        log_update_outcome(store, skill_id, "git", outcome.as_ref());
+        match outcome {
+            // The token no longer matched the recomputed list, and the update
+            // has already persisted the new one. Saying so is the whole job:
+            // applying it anyway is what the token exists to prevent.
+            Ok(result) if !result.pending_removals.is_empty() => {
+                Ok(ApprovalOutcome::ListChanged)
+            }
+            Ok(result) if result.gone => Ok(ApprovalOutcome::CannotApply(
+                "The Source no longer contains this skill".to_string(),
+            )),
+            Ok(result) if !result.moved.is_empty() => Ok(ApprovalOutcome::CannotApply(
+                "The Source moved this skill; re-point it before approving removals".to_string(),
+            )),
+            Ok(_) => Ok(ApprovalOutcome::Applied),
+            Err(err) => Ok(ApprovalOutcome::CannotApply(err.message)),
+        }
+    })
+}
+
+/// List every skill the last update held back, with the exact paths and the
+/// revision it was held at. Empty when nothing is waiting.
+#[tauri::command]
+pub async fn list_pending_removals(
+    store: State<'_, Arc<SkillStore>>,
+) -> Result<Vec<PendingRemovalGroup>, AppError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || pending_removal_groups(&store)).await?
+}
+
+/// Approve the stored removal list for each selected skill.
+///
+/// Each skill goes through the normal single-skill update with the token it was
+/// stored with; there is no bulk-delete path. Serial on purpose: a failure is
+/// easier to attribute to one skill than to a concurrent batch.
+#[tauri::command]
+pub async fn approve_removals(
+    skill_ids: Vec<String>,
+    store: State<'_, Arc<SkillStore>>,
+) -> Result<ApproveRemovalsResult, AppError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || approve_removals_internal(&store, skill_ids)).await?
 }
 
 /// Move a skill's source pointer to where the Source says it went.
@@ -2710,6 +3224,11 @@ pub fn repoint_skill_source_internal(
             "update_available",
             None,
         )?;
+        // The removals were computed against the old path; the next check has
+        // to describe the new one before anything is approved.
+        store
+            .clear_skill_pending_removals(&skill.id)
+            .map_err(AppError::db)?;
         // The metadata snapshot is the database's mirror and is what startup
         // reindexes from; without this line the new pointer would be undone by
         // the old file on the next launch. It writes no skill content — the
@@ -2750,6 +3269,19 @@ pub async fn repoint_skill_source(
 /// Holding the central-repo lock across a network round-trip is what made
 /// unrelated foreground operations fail with a 20s "repository is busy" (#315),
 /// so the fetch happens here and [`apply_prepared_update`] only writes.
+/// A skill a Source now holds that the library does not.
+#[derive(Debug, Clone, Serialize)]
+pub struct NewSkill {
+    pub name: String,
+    /// Where it sits in the repository, the form `source_subpath` takes.
+    pub subpath: String,
+    pub source_ref_resolved: String,
+    pub branch: Option<String>,
+    /// Stable selection and dismissal key, built here so the UI never has to
+    /// decide which URL spellings are the same Source.
+    pub key: String,
+}
+
 pub struct PreparedUpdate {
     pub source: RemoteRef,
     pub revision: String,
@@ -2893,6 +3425,10 @@ fn apply_prepared_update(
                 store
                     .replace_skill_move_candidates(&skill.id, &candidates)
                     .map_err(AppError::db)?;
+                // The old list described a path this skill no longer occupies.
+                store
+                    .clear_skill_pending_removals(&skill.id)
+                    .map_err(AppError::db)?;
                 return Ok(UpdateOutcome::Moved { candidates });
             }
             UpdateSite::Gone => {
@@ -2903,6 +3439,9 @@ fn apply_prepared_update(
                         "source_gone",
                         Some(SOURCE_GONE_MESSAGE),
                     )
+                    .map_err(AppError::db)?;
+                store
+                    .clear_skill_pending_removals(&skill.id)
                     .map_err(AppError::db)?;
                 return Ok(UpdateOutcome::Gone);
             }
@@ -2958,6 +3497,24 @@ fn apply_prepared_update(
                     None,
                 )
                 .map_err(AppError::db)?;
+            // Persist the question exactly as it was asked: the panel has to
+            // survive a restart, and approval must pass back the same token
+            // instead of re-deriving a list the user never saw.
+            let stored: Vec<PendingRemovalRecord> = pending
+                .iter()
+                .map(|removal| PendingRemovalRecord {
+                    location: removal.location.clone(),
+                    path: removal.path.clone(),
+                })
+                .collect();
+            store
+                .replace_skill_pending_removals(
+                    &skill.id,
+                    revision.as_str(),
+                    &approval,
+                    &stored,
+                )
+                .map_err(AppError::db)?;
             return Ok(UpdateOutcome::Held { pending, approval });
         }
 
@@ -3009,6 +3566,11 @@ fn apply_prepared_update(
                 sync_metadata::write_all_from_db_unlocked(store).map_err(AppError::db)?;
             }
         }
+        // Nothing is waiting for an approval any more: whatever list an older
+        // held state described, it no longer describes this skill.
+        store
+            .clear_skill_pending_removals(&skill.id)
+            .map_err(AppError::db)?;
         Ok(UpdateOutcome::Applied { content_changed })
     })();
     update_result
@@ -4608,8 +5170,184 @@ mod tests {
         (id.to_string(), skill)
     }
 
-    /// The whole point of the batch grouping: skills installed from different
-    /// subdirectories of one repository share a single resolution and fetch.
+    fn git(args: &[&str], cwd: &Path) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// A checkout with a committed tree, which is what discovery reads.
+    fn git_checkout(skills: &[&str]) -> TempDir {
+        let tmp = tempdir().unwrap();
+        for skill in skills {
+            let name = skill.rsplit('/').next().unwrap();
+            let dir = tmp.path().join(skill);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: fixture\n---\n"),
+            )
+            .unwrap();
+        }
+        git(&["init", "-q"], tmp.path());
+        git(&["add", "-A"], tmp.path());
+        git(
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "fixture",
+            ],
+            tmp.path(),
+        );
+        tmp
+    }
+
+    /// The discovered skill's Source is built, not parsed out of a tree URL: a
+    /// missing branch must stay missing and the subpath must survive verbatim.
+    #[test]
+    fn an_installed_new_skill_keeps_its_branch_and_subpath_separate() {
+        let source = new_skill_source(
+            "https://gitlab.com/acme/skills.git",
+            None,
+            "skills/beta",
+        )
+        .unwrap();
+        assert_eq!(source.clone_url, "https://gitlab.com/acme/skills.git");
+        assert_eq!(source.branch, None, "no branch is not a branch named 'skills'");
+        assert_eq!(source.subpath.as_deref(), Some("skills/beta"));
+
+        let branched =
+            new_skill_source("git@gitlab.com:acme/skills.git", Some("next"), "skills/beta")
+                .unwrap();
+        assert_eq!(branched.branch.as_deref(), Some("next"));
+
+        let root = new_skill_source("https://example.com/acme/skills", None, "").unwrap();
+        assert_eq!(root.subpath, None, "the repository root is the whole checkout");
+    }
+
+    /// The key is the only comparison the frontend gets, so spellings that name
+    /// one Source must fold to one key, and the branch must not disappear.
+    #[test]
+    fn a_new_skill_key_folds_spellings_and_keeps_the_branch() {
+        let plain = RemoteRef::from_url("https://example.com/acme/skills");
+        let dotted = RemoteRef::from_url("https://example.com/acme/skills.git");
+        let slashed = RemoteRef::from_url("https://example.com/acme/skills/");
+        let key = new_skill_key(&plain.identity(), "Fresh");
+
+        assert_eq!(key, new_skill_key(&dotted.identity(), "fresh"));
+        assert_eq!(key, new_skill_key(&slashed.identity(), "fresh"));
+
+        let mut next = plain.clone();
+        next.branch = Some("next".to_string());
+        assert_ne!(key, new_skill_key(&next.identity(), "fresh"));
+    }
+
+    /// A refusal is remembered, and the list has a ceiling so a library used for
+    /// years cannot grow it without bound.
+    #[test]
+    fn a_refused_new_skill_is_not_offered_again() {
+        let repo = test_repo();
+        let identity = RemoteRef::from_url("https://example.com/acme/skills.git").identity();
+        let key = new_skill_key(&identity, "fresh");
+
+        remember_dismissed_new_skills(&repo.store, vec![key.clone()]).unwrap();
+        assert!(dismissed_new_skills(&repo.store).contains(&key));
+
+        // Refusing twice is not two entries.
+        remember_dismissed_new_skills(&repo.store, vec![key.clone()]).unwrap();
+        assert_eq!(dismissed_new_skills(&repo.store).len(), 1);
+
+        let overflow = (0..=MAX_DISMISSED_NEW_SKILLS)
+            .map(|index| format!("{key}-{index}"))
+            .collect();
+        remember_dismissed_new_skills(&repo.store, overflow).unwrap();
+        let all = dismissed_new_skills(&repo.store);
+        assert_eq!(all.len(), MAX_DISMISSED_NEW_SKILLS);
+        assert!(!all.contains(&key), "the oldest entry is the one dropped");
+        assert!(all.contains(&format!("{key}-{MAX_DISMISSED_NEW_SKILLS}")));
+    }
+
+    /// The bug the ticket's first acceptance test names: a renamed skill is
+    /// locate's answer, and must not also be offered as a new install. That
+    /// install would rewrite the existing record's source path.
+    #[test]
+    fn a_rename_is_not_also_offered_as_a_new_skill() {
+        let checkout = git_checkout(&["skills/alpha", "skills/beta"]);
+        let record = stored(
+            "alpha",
+            "https://example.com/acme/skills",
+            None,
+            Some("skills/old-alpha"),
+        )
+        .1;
+        let source = RemoteRef::from_skill(&record).unwrap();
+        let members = vec![("alpha".to_string(), record)];
+        let mut seen = HashSet::new();
+
+        let found = collect_new_skills(
+            &source,
+            checkout.path(),
+            &members,
+            &[],
+            &HashSet::new(),
+            &mut seen,
+        );
+
+        assert_eq!(
+            found.iter().map(|skill| skill.name.as_str()).collect::<Vec<_>>(),
+            vec!["beta"]
+        );
+    }
+
+    /// `.git` and a trailing slash describe one repository. Comparing the
+    /// stored URL as a string missed that, so an installed skill came back as
+    /// new and installing it would overwrite the live directory.
+    #[test]
+    fn url_spellings_of_one_source_do_not_produce_a_second_prompt() {
+        let repo = test_repo();
+        let checkout = git_checkout(&["skills/alpha", "skills/beta"]);
+        let installed = stored(
+            "alpha",
+            "https://example.com/acme/skills.git",
+            None,
+            Some("skills/alpha"),
+        )
+        .1;
+        repo.store.insert_skill(&installed).unwrap();
+
+        let by_source = installed_subpaths_by_source(&repo.store).unwrap();
+        let source = RemoteRef::from_url("https://example.com/acme/skills/");
+        let known = by_source
+            .get(&source.identity())
+            .cloned()
+            .expect("the same remote, however it is spelled");
+
+        let mut seen = HashSet::new();
+        let found = collect_new_skills(
+            &source,
+            checkout.path(),
+            &[],
+            &known,
+            &HashSet::new(),
+            &mut seen,
+        );
+
+        assert_eq!(
+            found.iter().map(|skill| skill.name.as_str()).collect::<Vec<_>>(),
+            vec!["beta"]
+        );
+    }
+
     #[test]
     fn a_batch_asks_each_source_once() {
         let loaded = vec![
@@ -4665,20 +5403,37 @@ mod tests {
         central_files: &[(&str, &str)],
         checkout_files: &[(&str, &str)],
     ) -> (SkillRecord, PreparedUpdate, TempDir) {
+        prepared_fixture_named(
+            repo,
+            "skill-under-test",
+            "skill-under-test",
+            "skill",
+            central_files,
+            checkout_files,
+        )
+    }
+
+    fn prepared_fixture_named(
+        repo: &TestRepo,
+        id: &str,
+        name: &str,
+        subpath: &str,
+        central_files: &[(&str, &str)],
+        checkout_files: &[(&str, &str)],
+    ) -> (SkillRecord, PreparedUpdate, TempDir) {
         const SKILL_MD: (&str, &str) = ("SKILL.md", "---\nname: skill-under-test\ndescription: fixture\n---\n\nbody\n");
-        let id = "skill-under-test";
         let central_path = central_repo::skills_dir().join(id);
         write_tree(&central_path, &[&[SKILL_MD], central_files].concat());
         let hash = crate::core::content_hash::hash_directory(&central_path).unwrap();
 
         let record = SkillRecord {
             id: id.to_string(),
-            name: "skill-under-test".to_string(),
+            name: name.to_string(),
             description: None,
             source_type: "git".to_string(),
             source_ref: Some("https://example.com/acme/skills".to_string()),
             source_ref_resolved: Some("https://example.com/acme/skills".to_string()),
-            source_subpath: Some("skill".to_string()),
+            source_subpath: Some(subpath.to_string()),
             source_branch: None,
             source_revision: Some("rev1".to_string()),
             remote_revision: Some("rev1".to_string()),
@@ -4696,7 +5451,7 @@ mod tests {
 
         let checkout = tempdir().unwrap();
         write_tree(
-            &checkout.path().join("skill"),
+            &checkout.path().join(subpath),
             &[&[SKILL_MD], checkout_files].concat(),
         );
         let prepared = PreparedUpdate {
@@ -4772,6 +5527,299 @@ mod tests {
         assert_eq!(fs::read_to_string(central.join("keep-me.txt")).unwrap(), "mine");
         let after = repo.store.get_skill_by_id(&record.id).unwrap().unwrap();
         assert_eq!(after.update_status, "update_available");
+    }
+
+    #[test]
+    fn a_held_update_persists_every_path_and_its_revision() {
+        let repo = test_repo();
+        let (record, prepared, _checkout) = prepared_fixture(
+            &repo,
+            &[("a.txt", "old"), ("keep-me.txt", "mine")],
+            &[("a.txt", "new")],
+        );
+        // A copy-mode deployment holds a file the new version also drops: the
+        // stored list must name that directory too, not just the library.
+        let target_dir = repo._tmp.path().join("agent/skill-under-test");
+        fs::create_dir_all(&target_dir).unwrap();
+        fs::write(target_dir.join("SKILL.md"), "---\nname: skill-under-test\n---\n").unwrap();
+        fs::write(target_dir.join("agent-only.md"), "agent copy").unwrap();
+        repo.store
+            .insert_target(&SkillTargetRecord {
+                id: "target-1".to_string(),
+                skill_id: record.id.clone(),
+                tool: "claude_code".to_string(),
+                target_path: target_dir.to_string_lossy().to_string(),
+                mode: "copy".to_string(),
+                status: "ok".to_string(),
+                synced_at: Some(1),
+                last_error: None,
+                source_hash: None,
+            })
+            .unwrap();
+
+        let held = apply_prepared_update(&repo.store, &record, &prepared, None, false).unwrap();
+        let approval = match held {
+            UpdateOutcome::Held { pending, approval } => {
+                assert_eq!(pending.len(), 2);
+                approval
+            }
+            other => panic!("expected the update to be held, got {other:?}"),
+        };
+
+        let groups = pending_removal_groups(&repo.store).unwrap();
+        assert_eq!(groups.len(), 2, "the library and one agent copy");
+        let group = &groups[0];
+        assert_eq!(group.skill_id, record.id);
+        assert_eq!(group.skill_name, record.name);
+        assert_eq!(group.source, "https://example.com/acme/skills");
+        assert_eq!(group.revision, "rev2");
+        assert_eq!(group.location, LIBRARY_LOCATION, "the library reads first");
+        assert_eq!(group.paths, vec!["keep-me.txt".to_string()]);
+        assert_eq!(groups[1].location, "claude_code");
+        assert_eq!(groups[1].paths, vec!["agent-only.md".to_string()]);
+
+        let stored = repo
+            .store
+            .get_skill_pending_removals(&record.id)
+            .unwrap()
+            .expect("the held list must survive the call");
+        assert_eq!(stored.revision, "rev2");
+        assert_eq!(stored.approval, approval, "the token shown is the token stored");
+        assert_eq!(
+            stored.removals,
+            vec![
+                PendingRemovalRecord {
+                    location: LIBRARY_LOCATION.to_string(),
+                    path: "keep-me.txt".to_string(),
+                },
+                PendingRemovalRecord {
+                    location: "claude_code".to_string(),
+                    path: "agent-only.md".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn applying_or_approving_a_held_update_clears_its_rows() {
+        let repo = test_repo();
+        let (held, prepared, _checkout) = prepared_fixture_named(
+            &repo,
+            "held",
+            "held",
+            "skill",
+            &[("a.txt", "old"), ("keep-me.txt", "mine")],
+            &[("a.txt", "new")],
+        );
+        apply_prepared_update(&repo.store, &held, &prepared, None, false).unwrap();
+        let stored = repo
+            .store
+            .get_skill_pending_removals(&held.id)
+            .unwrap()
+            .expect("held first");
+        assert!(!stored.removals.is_empty());
+
+        let approved = apply_prepared_update(
+            &repo.store,
+            &held,
+            &prepared,
+            Some(&stored.approval),
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            approved,
+            UpdateOutcome::Applied {
+                content_changed: true
+            }
+        ));
+        assert!(!Path::new(&held.central_path).join("keep-me.txt").exists());
+        assert!(
+            repo.store
+                .get_skill_pending_removals(&held.id)
+                .unwrap()
+                .is_none(),
+            "an approved list must not outlive the approval"
+        );
+
+        // A skill that ends `up_to_date` is just as finished: a row from an
+        // older held state must not survive the verdict.
+        let (clean, clean_prepared, _clean_checkout) = prepared_fixture_named(
+            &repo,
+            "clean",
+            "clean",
+            "skill",
+            &[("a.txt", "same")],
+            &[("a.txt", "same")],
+        );
+        repo.store
+            .replace_skill_pending_removals(
+                &clean.id,
+                "rev1",
+                "stale-token",
+                &[PendingRemovalRecord {
+                    location: LIBRARY_LOCATION.to_string(),
+                    path: "gone.txt".to_string(),
+                }],
+            )
+            .unwrap();
+        let outcome =
+            apply_prepared_update(&repo.store, &clean, &clean_prepared, None, false).unwrap();
+        assert!(matches!(
+            outcome,
+            UpdateOutcome::Applied {
+                content_changed: false
+            }
+        ));
+        assert!(repo
+            .store
+            .get_skill_pending_removals(&clean.id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_stale_stored_token_never_deletes_files() {
+        let repo = test_repo();
+        let (record, prepared, _checkout) = prepared_fixture(
+            &repo,
+            &[("a.txt", "old"), ("keep-me.txt", "mine")],
+            &[("a.txt", "new")],
+        );
+        apply_prepared_update(&repo.store, &record, &prepared, None, false).unwrap();
+
+        // The stored question now describes a revision the remote has left.
+        let stored = repo
+            .store
+            .get_skill_pending_removals(&record.id)
+            .unwrap()
+            .unwrap();
+        repo.store
+            .replace_skill_pending_removals(
+                &record.id,
+                "rev-old",
+                "a-token-for-a-different-question",
+                &stored.removals,
+            )
+            .unwrap();
+
+        let result = approve_pending_removals_with(
+            &repo.store,
+            vec![record.id.clone()],
+            |store, _id, token| match apply_prepared_update(
+                store, &record, &prepared, Some(token), false,
+            )? {
+                UpdateOutcome::Applied { .. } => Ok(ApprovalOutcome::Applied),
+                UpdateOutcome::Held { .. } => Ok(ApprovalOutcome::ListChanged),
+                UpdateOutcome::Moved { .. } => {
+                    Ok(ApprovalOutcome::CannotApply("moved".to_string()))
+                }
+                UpdateOutcome::Gone => Ok(ApprovalOutcome::CannotApply("gone".to_string())),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.approved, 0);
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].name, record.name);
+        assert_eq!(result.failed[0].message, PENDING_REMOVALS_CHANGED_MESSAGE);
+        let central = Path::new(&record.central_path);
+        assert!(central.join("keep-me.txt").is_file(), "nothing may be deleted");
+        let after = repo.store.get_skill_by_id(&record.id).unwrap().unwrap();
+        assert_eq!(after.update_status, "update_available");
+        let regrown = repo
+            .store
+            .get_skill_pending_removals(&record.id)
+            .unwrap()
+            .expect("the new question must replace the stale one");
+        assert_eq!(regrown.revision, "rev2");
+        assert_ne!(regrown.approval, "a-token-for-a-different-question");
+    }
+
+    #[test]
+    fn approving_a_batch_reports_each_skill_and_leaves_the_stale_one_alone() {
+        let repo = test_repo();
+        let mut fixtures: HashMap<String, (SkillRecord, PreparedUpdate)> = HashMap::new();
+        let mut checkouts = Vec::new();
+        for id in ["a", "b", "c"] {
+            let (record, prepared, checkout) = prepared_fixture_named(
+                &repo,
+                id,
+                id,
+                "skill",
+                &[("a.txt", "old"), ("mine.txt", "mine")],
+                &[("a.txt", "new")],
+            );
+            fixtures.insert(id.to_string(), (record, prepared));
+            checkouts.push(checkout);
+        }
+
+        for (record, prepared) in fixtures.values() {
+            let outcome =
+                apply_prepared_update(&repo.store, record, prepared, None, false).unwrap();
+            assert!(matches!(outcome, UpdateOutcome::Held { .. }));
+        }
+
+        // One stored question no longer matches the revision a fresh update
+        // computes, so its approval cannot cover the list.
+        let (stale_record, _) = fixtures.get("c").unwrap();
+        let stale = repo
+            .store
+            .get_skill_pending_removals(&stale_record.id)
+            .unwrap()
+            .unwrap();
+        repo.store
+            .replace_skill_pending_removals(
+                &stale_record.id,
+                "rev-old",
+                "stale-token",
+                &stale.removals,
+            )
+            .unwrap();
+
+        let result = approve_pending_removals_with(
+            &repo.store,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            |store, id, token| {
+                let (record, prepared) = fixtures.get(id).expect("known fixture");
+                match apply_prepared_update(store, record, prepared, Some(token), false)? {
+                    UpdateOutcome::Applied { .. } => Ok(ApprovalOutcome::Applied),
+                    UpdateOutcome::Held { .. } => Ok(ApprovalOutcome::ListChanged),
+                    UpdateOutcome::Moved { .. } => {
+                        Ok(ApprovalOutcome::CannotApply("moved".to_string()))
+                    }
+                    UpdateOutcome::Gone => Ok(ApprovalOutcome::CannotApply("gone".to_string())),
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.approved, 2);
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].name, "c");
+        let central = |id: &str| {
+            Path::new(&fixtures.get(id).unwrap().0.central_path).to_path_buf()
+        };
+        assert!(!central("a").join("mine.txt").exists());
+        assert!(!central("b").join("mine.txt").exists());
+        assert!(
+            central("c").join("mine.txt").is_file(),
+            "the stale approval must not delete anything"
+        );
+        for id in ["a", "b"] {
+            assert!(
+                repo.store
+                    .get_skill_pending_removals(&fixtures[id].0.id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let still_held = repo
+            .store
+            .get_skill_pending_removals(&fixtures["c"].0.id)
+            .unwrap()
+            .expect("the refreshed question stays for the panel");
+        assert_eq!(still_held.revision, "rev2");
     }
 
     /// The batch pays for one whole-library rewrite, at the end. Anything that

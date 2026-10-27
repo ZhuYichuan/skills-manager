@@ -351,6 +351,45 @@ export interface PendingRemoval {
   path: string;
 }
 
+/**
+ * One skill's stored removals in one location. A skill appears once per
+ * location because that is how the panel groups the paths, while approval is
+ * still per skill and covers all of them.
+ */
+export interface PendingRemovalGroup {
+  skill_id: string;
+  skill_name: string;
+  /** The Source the skill came from, in the form `source_ref_resolved` stores. */
+  source: string;
+  /** The revision the stored list describes. */
+  revision: string;
+  /** `"library"`, or the agent key whose copy holds it. */
+  location: string;
+  paths: string[];
+}
+
+export interface FailedRemoval {
+  name: string;
+  message: string;
+}
+
+export interface ApproveRemovalsResult {
+  approved: number;
+  failed: FailedRemoval[];
+}
+
+/** Every skill the last update held back, with the paths it would delete. */
+export const listPendingRemovals = () =>
+  invoke<PendingRemovalGroup[]>("list_pending_removals");
+
+/**
+ * Approve the stored removal list for each skill. Each one goes through the
+ * normal single-skill update with the token it was stored with; a failure is
+ * reported per skill, never rolled back across skills.
+ */
+export const approveRemovals = (skillIds: string[]) =>
+  invoke<ApproveRemovalsResult>("approve_removals", { skillIds });
+
 /** `approvedRemovals` carries back `removal_approval` from a declined call. */
 export const updateSkill = (skillId: string, approvedRemovals?: string | null) =>
   invoke<UpdateSkillResult>("update_skill", {
@@ -365,6 +404,19 @@ export const updateSkill = (skillId: string, approvedRemovals?: string | null) =
 export const repointSkillSource = (skillId: string, subpath: string) =>
   invoke<ManagedSkill>("repoint_skill_source", { skillId, subpath });
 
+export interface NewSkill {
+  name: string;
+  /** Where it sits in the repository, the form `source_subpath` takes. */
+  subpath: string;
+  source_ref_resolved: string;
+  branch: string | null;
+  /**
+   * Stable selection and dismissal key from the backend: Source identity
+   * (URL spellings folded, branch included) plus the name. Never rebuild it.
+   */
+  key: string;
+}
+
 export interface BatchUpdateSkillsResult {
   refreshed: number;
   unchanged: number;
@@ -377,6 +429,8 @@ export interface BatchUpdateSkillsResult {
   held_back_paths: number;
   /** Skills their Source still has, but no longer at the recorded path. */
   moved_sources: MovedSource[];
+  /** Skills the Sources now hold that the library does not. Never installed automatically. */
+  new_skills: NewSkill[];
   /** Skills their Source no longer has anywhere. */
   gone_sources: string[];
 }
@@ -402,6 +456,27 @@ export const batchUpdateSkills = (skillIds: string[]) =>
 
 /** Stop a running batch update. Skills already finished stay finished. */
 export const cancelBatchUpdate = () => invoke<boolean>("cancel_batch_update");
+
+/** Stop offering these discovered skills; the next round filters them out. */
+export const dismissNewSkills = (keys: string[]) =>
+  invoke<void>("dismiss_new_skills", { keys });
+
+/**
+ * Install one skill the round discovered, from the Source and path it gave.
+ *
+ * Not a tree URL: the backend already has the branch and subpath separately,
+ * and a branch-less or non-GitHub Source does not survive the string form.
+ */
+export const installNewSkill = (
+  sourceRefResolved: string,
+  branch: string | null,
+  subpath: string
+) =>
+  invoke<void>("install_new_skill", {
+    sourceRefResolved,
+    branch,
+    subpath,
+  });
 
 export interface ReimportSkillResult {
   skill: ManagedSkill;

@@ -23,12 +23,14 @@
 //! the same checkout pay for the walk per skill; caching is deliberately not
 //! part of this module's state.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::core::content_hash;
+use crate::core::git_command::git_command;
 use crate::core::path_guard;
 use crate::core::skill_metadata;
 use crate::core::skill_store::SkillRecord;
@@ -104,6 +106,150 @@ pub enum Placement {
     /// Nowhere in this checkout. Not an error — a real answer, and one that
     /// stops the "retry the update forever" loop.
     Gone,
+}
+
+/// A skill the Source holds that this library does not.
+///
+/// The other half of "where is my skill": `locate` answers for one skill the
+/// library already has, `discover` answers for the ones it does not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveredSkill {
+    /// Path relative to the checkout root, in the form `source_subpath` takes.
+    pub subpath: String,
+    /// The name to show and to install under: frontmatter first, directory last.
+    pub name: String,
+    /// Every path the same skill was found at, when a repository ships one skill
+    /// under several trees (`.claude/skills/x` and `.agents/skills/x`). The first
+    /// entry is `subpath`; the rest exist so a caller can tell a duplicate from a
+    /// genuinely new skill.
+    pub also_at: Vec<String>,
+}
+
+/// Skills in the commit `checkout` points at that `installed_subpaths` does not
+/// cover.
+///
+/// Deliberately reads the tree, not the working copy. The checkout a round scans
+/// was fetched for one skill, so its sparse cone holds that one directory and a
+/// filesystem walk can only ever find skills the library already has. The
+/// commit's tree is complete even in a blobless clone, so `git ls-tree` answers
+/// offline and without fetching a single skill's content.
+///
+/// Deliberately keyed by directory name after the first sighting: a repository
+/// that keeps one skill in two trees (a Claude layout and an agents layout) is
+/// one new skill, not two prompts. Names are compared case-insensitively,
+/// because two directories differing only by case are the same skill in practice.
+///
+/// `installed_subpaths` is what the library already has from this Source; a
+/// directory whose subpath is in there is not new, whatever its name says — a
+/// rename is `locate`'s question, not this one.
+pub fn discover(checkout: &Path, installed_subpaths: &[String]) -> Vec<DiscoveredSkill> {
+    let installed: HashSet<String> = installed_subpaths
+        .iter()
+        .filter_map(|subpath| normalize_subpath(Some(subpath)))
+        .collect();
+    let mut found: Vec<DiscoveredSkill> = Vec::new();
+    let mut by_name: HashMap<String, usize> = HashMap::new();
+
+    for subpath in skill_subpaths_in_tree(checkout) {
+        if installed.contains(&subpath) {
+            continue;
+        }
+        let name = directory_name(checkout, &subpath);
+
+        match by_name.get(&name.to_lowercase()) {
+            Some(&at) => {
+                if !found[at].also_at.contains(&subpath) {
+                    found[at].also_at.push(subpath);
+                }
+            }
+            None => {
+                by_name.insert(name.to_lowercase(), found.len());
+                found.push(DiscoveredSkill {
+                    subpath,
+                    name,
+                    also_at: Vec::new(),
+                });
+            }
+        }
+    }
+
+    found.sort_by(|a, b| a.subpath.cmp(&b.subpath));
+    found
+}
+
+/// Every directory in the commit's tree that holds a `SKILL.md`, as the
+/// `/`-separated subpath `source_subpath` uses. The checkout root is `""`.
+fn skill_subpaths_in_tree(checkout: &Path) -> Vec<String> {
+    let output = match git_command()
+        .arg("-C")
+        .arg(checkout)
+        .args(["ls-tree", "-r", "-z", "--name-only", "HEAD"])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            log::warn!(
+                "discover: cannot read the tree at {}: {}",
+                checkout.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            return Vec::new();
+        }
+        Err(error) => {
+            log::warn!(
+                "discover: cannot run git in {}: {error}",
+                checkout.display()
+            );
+            return Vec::new();
+        }
+    };
+
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|raw| std::str::from_utf8(raw).ok())
+        .filter_map(skill_dir_from_tree_path)
+        .collect()
+}
+
+/// The directory part of a tracked file path, when that file is a `SKILL.md`.
+///
+/// Names come from the directory, never from the file: reading frontmatter would
+/// fetch blobs the narrow clone deliberately never downloaded.
+fn skill_dir_from_tree_path(path: &str) -> Option<String> {
+    let mut parts: Vec<&str> = path.split('/').collect();
+    let file = parts.pop()?;
+    if file != "SKILL.md" {
+        return None;
+    }
+    if parts.len() > MAX_SCAN_DEPTH {
+        return None;
+    }
+    if parts.iter().any(|part| {
+        part.is_empty()
+            || PRUNED_DIRS
+                .iter()
+                .any(|pruned| part.eq_ignore_ascii_case(pruned))
+    }) {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
+/// The name to show and to install under, taken from the directory.
+fn directory_name(checkout: &Path, subpath: &str) -> String {
+    let basename = subpath
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
+    basename
+        .or_else(|| {
+            checkout
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "skill".to_string())
 }
 
 /// Where does `skill` sit in `checkout`?
@@ -641,6 +787,144 @@ mod tests {
         let record = stored("alpha", Some("skills/alpha"), Some("deadbeef"));
 
         assert_eq!(locate(&record, checkout.path()), Placement::Gone);
+    }
+
+    fn write_skill(dir: &Path, frontmatter_name: Option<&str>) {
+        std::fs::create_dir_all(dir).unwrap();
+        let body = match frontmatter_name {
+            Some(name) => format!("---\nname: {name}\n---\nbody\n"),
+            None => "body\n".to_string(),
+        };
+        std::fs::write(dir.join("SKILL.md"), body).unwrap();
+    }
+
+    fn git(args: &[&str], cwd: Option<&Path>) {
+        let mut command = crate::core::git_command::git_command();
+        if let Some(cwd) = cwd {
+            command.arg("-C").arg(cwd);
+        }
+        let status = command.args(args).status().unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// A checkout of `repo` narrowed to `cone`, exactly as the round receives a
+    /// Source: only the installed skill is on disk, the rest lives in the tree.
+    fn sparse_checkout(repo: &Path, cone: &str) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        git(
+            &[
+                "clone",
+                "-q",
+                "--no-checkout",
+                repo.to_str().unwrap(),
+                tmp.path().to_str().unwrap(),
+            ],
+            None,
+        );
+        git(&["sparse-checkout", "init", "--cone"], Some(tmp.path()));
+        git(&["sparse-checkout", "set", cone], Some(tmp.path()));
+        git(&["checkout", "-q", "HEAD"], Some(tmp.path()));
+        tmp
+    }
+
+    fn commit_all(root: &Path) {
+        git(&["init", "-q"], Some(root));
+        git(&["add", "-A"], Some(root));
+        git(
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "fixture",
+            ],
+            Some(root),
+        );
+    }
+
+    /// A real repository whose committed tree holds `skills`, so discovery can
+    /// ask git rather than the working copy.
+    fn git_repo(skills: &[&str]) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        for skill in skills {
+            let name = skill.rsplit('/').next().unwrap();
+            write_skill(&tmp.path().join(skill), Some(name));
+        }
+        commit_all(tmp.path());
+        tmp
+    }
+
+    /// The round's checkout is sparse: it holds only the skill the fetch was
+    /// narrowed to, so a filesystem walk can never see a skill added upstream.
+    /// The commit's tree still holds every skill, and a blobless clone has all
+    /// the trees, which is why discovery reads `ls-tree` and stays offline.
+    #[test]
+    fn a_skill_only_the_tree_holds_is_still_found() {
+        let repo = git_repo(&["skills/alpha", "skills/beta"]);
+        let checkout = sparse_checkout(repo.path(), "skills/alpha");
+        assert!(checkout.path().join("skills/alpha").is_dir());
+        assert!(
+            !checkout.path().join("skills/beta").exists(),
+            "the fixture must be sparse, or the test proves nothing"
+        );
+
+        let found = discover(checkout.path(), &["skills/alpha".to_string()]);
+
+        assert_eq!(
+            found.iter().map(|skill| skill.name.as_str()).collect::<Vec<_>>(),
+            vec!["beta"]
+        );
+    }
+
+    #[test]
+    fn two_trees_holding_one_skill_are_one_new_skill() {
+        let repo = git_repo(&[".claude/skills/captions", ".agents/skills/captions"]);
+
+        let found = discover(repo.path(), &[]);
+
+        assert_eq!(found.len(), 1, "one skill, two layouts");
+        assert_eq!(found[0].name, "captions");
+        assert_eq!(found[0].also_at.len(), 1, "the second tree is recorded, not listed");
+    }
+
+    #[test]
+    fn a_subpath_the_library_already_has_is_not_new() {
+        let repo = git_repo(&["skills/known", "skills/fresh"]);
+
+        let found = discover(repo.path(), &["skills/known".to_string()]);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].subpath, "skills/fresh");
+    }
+
+    #[test]
+    fn the_name_comes_from_the_directory_not_the_frontmatter() {
+        let repo = TempDir::new().unwrap();
+        write_skill(&repo.path().join("skills/nameless"), Some("frontmatter-name"));
+        commit_all(repo.path());
+
+        let found = discover(repo.path(), &[]);
+
+        assert_eq!(found[0].name, "nameless");
+    }
+
+    #[test]
+    fn names_that_differ_only_by_case_are_one_skill() {
+        let repo = git_repo(&["a/Captions", "b/captions"]);
+
+        assert_eq!(discover(repo.path(), &[]).len(), 1);
+    }
+
+    #[test]
+    fn git_metadata_holds_no_skills() {
+        let repo = git_repo(&[]);
+        write_skill(&repo.path().join(".git/fake"), Some("fake"));
+
+        assert!(discover(repo.path(), &[]).is_empty());
     }
 
     #[test]

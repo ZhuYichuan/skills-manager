@@ -24,6 +24,7 @@ import {
   ChevronDown,
   ChevronRight,
   FolderTree,
+  FileWarning,
   Pencil,
   Share2,
   Tag,
@@ -43,6 +44,8 @@ import { ConfirmDialog } from "../components/ConfirmDialog";
 import { TagRenameDialog } from "../components/TagRenameDialog";
 import { SkillDetailPanel } from "../components/SkillDetailPanel";
 import { MultiSelectToolbar } from "../components/MultiSelectToolbar";
+import { NewSkillsDialog } from "../components/NewSkillsDialog";
+import { PendingRemovalsDialog } from "../components/PendingRemovalsDialog";
 import { BatchTagDialog } from "../components/BatchTagDialog";
 import { BatchSyncAgentDialog } from "../components/BatchSyncAgentDialog";
 import { SyncDots } from "../components/SyncDots";
@@ -207,6 +210,15 @@ export function MySkills() {
   // A long round with only a spinner reads as "stuck": the round reports each
   // skill it finishes, so the button can say how far it has got.
   const [batchProgress, setBatchProgress] = useState<{ done: number; total: number } | null>(null);
+  // Skills the Sources gained during the round. Offered, never installed.
+  const [newSkills, setNewSkills] = useState<api.NewSkill[]>([]);
+  const [installingNew, setInstallingNew] = useState(false);
+  // Skills whose last update was held back because it would delete files. The
+  // list is persisted by the backend, so it survives a restart and a closed
+  // dialog; the toolbar only offers the review when there is something in it.
+  const [pendingRemovals, setPendingRemovals] = useState<api.PendingRemovalGroup[]>([]);
+  const [reviewingRemovals, setReviewingRemovals] = useState(false);
+  const [approvingRemovals, setApprovingRemovals] = useState(false);
   const [toolToggles, setToolToggles] = useState<SkillToolToggle[] | null>(null);
   const [togglingToolKey, setTogglingToolKey] = useState<string | null>(null);
   const [togglingTarget, setTogglingTarget] = useState<{ skillId: string; tool: string } | null>(null);
@@ -239,6 +251,20 @@ export function MySkills() {
       .then((rows) => setConflictIds(new Set(rows.map((row) => row.skill_id))))
       .catch(() => setConflictIds(new Set()));
   }, [skills]);
+
+  const refreshPendingRemovals = useCallback(async () => {
+    // A failed read is not a reason to hide the library; it just means there
+    // is nothing new to offer until the next refresh.
+    const groups = await api.listPendingRemovals().catch(() => []);
+    setPendingRemovals(groups);
+    if (groups.length === 0) setReviewingRemovals(false);
+  }, []);
+
+  // `skills` changes after every update, delete and approve, which is exactly
+  // when a stored removal list can become stale or disappear.
+  useEffect(() => {
+    void refreshPendingRemovals();
+  }, [skills, refreshPendingRemovals]);
 
   const refreshAllTags = async () => {
     try {
@@ -796,6 +822,9 @@ export function MySkills() {
     setBatchProgress({ done: 0, total: ids.length });
     try {
       const result = await api.batchUpdateSkills(ids);
+      if (result.new_skills.length > 0) {
+        setNewSkills(result.new_skills);
+      }
       if (result.cancelled) {
         toast.info(t("mySkills.batchUpdateCancelled", { count: result.refreshed }));
       }
@@ -847,6 +876,59 @@ export function MySkills() {
       setBatchUpdating(false);
       setBatchProgress(null);
     }
+  };
+
+  const handleApproveRemovals = async (skillIds: string[]) => {
+    if (skillIds.length === 0) return;
+    setApprovingRemovals(true);
+    try {
+      const result = await api.approveRemovals(skillIds);
+      if (result.approved > 0) {
+        toast.success(t("mySkills.pendingRemovals.approved", { count: result.approved }));
+      }
+      if (result.failed.length > 0) {
+        // The list is refreshed below, including when the only failure was a
+        // token that no longer matches: the new question has to be readable.
+        toast.error(
+          t("mySkills.pendingRemovals.approveFailed", { count: result.failed.length })
+        );
+      }
+    } catch (error: unknown) {
+      toast.error(getErrorMessage(error, t("common.error")));
+    } finally {
+      setApprovingRemovals(false);
+      await refreshPendingRemovals();
+      await refreshManagedSkills();
+    }
+  };
+
+  const installChosenNewSkills = async (chosen: api.NewSkill[]) => {
+    if (chosen.length === 0) return;
+    setInstallingNew(true);
+    try {
+      for (const skill of chosen) {
+        await api.installNewSkill(
+          skill.source_ref_resolved,
+          skill.branch,
+          skill.subpath
+        );
+      }
+      toast.success(t("mySkills.newSkills.installed", { count: chosen.length }));
+    } catch (error: unknown) {
+      toast.error(getErrorMessage(error, t("common.error")));
+    } finally {
+      setInstallingNew(false);
+      setNewSkills([]);
+      await refreshManagedSkills();
+    }
+  };
+
+  const dismissOfferedNewSkills = (offered: api.NewSkill[]) => {
+    setNewSkills([]);
+    // Remembered so the next round does not ask about the same ones again.
+    void api
+      .dismissNewSkills(offered.map((skill) => skill.key))
+      .catch((error: unknown) => console.error("Failed to remember dismissal:", error));
   };
 
   const handleBatchRefresh = () => {
@@ -1266,6 +1348,10 @@ export function MySkills() {
     () => updatableSkills(skills).length,
     [skills]
   );
+  const pendingRemovalSkillCount = useMemo(
+    () => new Set(pendingRemovals.map((group) => group.skill_id)).size,
+    [pendingRemovals]
+  );
   const refreshableSelectedCount = useMemo(
     () => skills.filter((skill) => selectedIds.has(skill.id) && canRefresh(skill)).length,
     [skills, selectedIds]
@@ -1419,6 +1505,16 @@ export function MySkills() {
                 className="mr-2 rounded-md px-2.5 py-2 text-[13px] font-medium text-muted transition-colors hover:bg-surface-hover hover:text-secondary"
               >
                 {t("mySkills.cancelBatchUpdate")}
+              </button>
+            )}
+            {pendingRemovalSkillCount > 0 && (
+              <button
+                onClick={() => setReviewingRemovals(true)}
+                disabled={batchUpdating || approvingRemovals}
+                className="mr-2 inline-flex items-center gap-1 rounded-md px-3 py-2 text-[13px] font-medium text-amber-600 transition-colors hover:bg-amber-500/10 disabled:opacity-50 dark:text-amber-400"
+              >
+                <FileWarning className="h-3.5 w-3.5" />
+                {t("mySkills.pendingRemovals.review", { count: pendingRemovalSkillCount })}
               </button>
             )}
             <span aria-hidden="true" className="mx-1 h-5 w-px shrink-0 self-center bg-border-subtle" />
@@ -1783,7 +1879,13 @@ export function MySkills() {
                       )}
                     </div>
                     <h3
-                      className="flex-1 truncate text-[14px] font-semibold text-primary group-hover:text-accent-light"
+                      className={cn(
+                        "flex-1 truncate text-[14px] font-semibold text-primary group-hover:text-accent-light",
+                        // Gone upstream: the name is the only thing that is no
+                        // longer true about this skill. The row stays usable so
+                        // the copy can still be detached or deleted.
+                        isGoneSource && "line-through text-muted"
+                      )}
                       title={displayName}
                     >
                       {displayName}
@@ -2055,7 +2157,10 @@ export function MySkills() {
                 </div>
 
                 <h3
-                  className="w-[180px] shrink-0 truncate text-[14px] font-semibold text-secondary group-hover:text-primary"
+                  className={cn(
+                    "w-[180px] shrink-0 truncate text-[14px] font-semibold text-secondary group-hover:text-primary",
+                    isGoneSource && "line-through text-muted"
+                  )}
                   title={displayName}
                 >
                   {displayName}
@@ -2259,6 +2364,21 @@ export function MySkills() {
           }
         }}
       />
+      {reviewingRemovals && (
+        <PendingRemovalsDialog
+          groups={pendingRemovals}
+          approving={approvingRemovals}
+          onApprove={handleApproveRemovals}
+          onClose={() => setReviewingRemovals(false)}
+        />
+      )}
+      <NewSkillsDialog
+        skills={newSkills}
+        installing={installingNew}
+        onInstall={installChosenNewSkills}
+        onDismiss={dismissOfferedNewSkills}
+      />
+
       <ConfirmDialog
         open={batchDeleteConfirm}
         message={t("mySkills.batchDeleteConfirm", { count: selectedIds.size })}

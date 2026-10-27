@@ -439,6 +439,26 @@
       "tagDeleted": "标签已删除",
       "deleteConfirm": "确定从所有技能中移除标签「{{tag}}」吗？"
     },
+      "pendingRemovals": {
+    "review": "审阅 {{count}}",
+    "title": "{{count}} 个技能会删除文件",
+    "hint": "这些更新会移除 {{count}} 个文件。勾选并批准之前不会删除任何东西。",
+    "paths": "{{count}} 个文件",
+    "library": "库目录",
+    "expand": "展开文件",
+    "collapse": "收起文件",
+    "approve": "批准所选（{{count}}）",
+    "close": "以后再说",
+    "approved": "已更新 {{count}} 个技能",
+    "approveFailed": "{{count}} 个技能未批准；清单已刷新，请再看一次"
+  },
+  "newSkills": {
+        "title": "来源里有 {{count}} 个新技能",
+        "hint": "你的技能库还没有它们。不勾选就不会安装。",
+        "install": "安装 {{count}} 个",
+        "notNow": "以后再说",
+        "installed": "已安装 {{count}} 个技能"
+      },
     "selectMode": "多选",
     "selectedCount": "已选 {{count}} 个",
     "selectHint": "点击 Skill 开始选择",
