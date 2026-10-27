@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Download, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { cn } from "../utils";
 import type { NewSkill } from "../lib/tauri";
+import { toggleAll, toggleOne, toggleRange } from "../lib/newSkillSelection";
 
 interface Props {
   skills: NewSkill[];
@@ -22,22 +23,27 @@ interface Props {
 export function NewSkillsDialog({ skills, installing, onInstall, onDismiss }: Props) {
   const { t } = useTranslation();
   const [chosen, setChosen] = useState<Set<string>>(new Set());
-
-  if (skills.length === 0) return null;
+  // Shift-click ranges need a starting row; it moves with every plain click,
+  // exactly as the library's own list behaves.
+  const [anchor, setAnchor] = useState<string | null>(null);
 
   // The key is the backend's: it folds URL spellings and carries the branch.
   const keyOf = (skill: NewSkill) => skill.key;
-  const toggle = (skill: NewSkill) => {
-    const key = keyOf(skill);
-    setChosen((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
-  };
-
+  const ordered = useMemo(() => skills.map(keyOf), [skills]);
   const selected = skills.filter((skill) => chosen.has(keyOf(skill)));
+  const allChosen = ordered.length > 0 && chosen.size === ordered.length;
+
+  if (skills.length === 0) return null;
+
+  const toggle = (skill: NewSkill, shiftKey: boolean) => {
+    const key = keyOf(skill);
+    if (shiftKey && anchor) {
+      setChosen((prev) => toggleRange(prev, ordered, anchor, key));
+      return;
+    }
+    setChosen((prev) => toggleOne(prev, key));
+    setAnchor(key);
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
@@ -56,7 +62,16 @@ export function NewSkillsDialog({ skills, installing, onInstall, onDismiss }: Pr
             <X className="h-4 w-4" />
           </button>
         </div>
-        <p className="mb-4 text-[12px] text-muted">{t("mySkills.newSkills.hint")}</p>
+        <div className="mb-4 flex items-center justify-between gap-2">
+          <p className="min-w-0 flex-1 text-[12px] text-muted">{t("mySkills.newSkills.hint")}</p>
+          <button
+            type="button"
+            onClick={() => setChosen((prev) => toggleAll(prev, ordered))}
+            className="shrink-0 rounded-md px-2 py-0.5 text-[12px] font-medium text-muted transition-colors hover:bg-surface-hover hover:text-secondary"
+          >
+            {allChosen ? t("mySkills.deselectAll") : t("mySkills.selectAll")}
+          </button>
+        </div>
 
         <div className="-mx-1 min-h-0 flex-1 overflow-y-auto px-1">
           {skills.map((skill) => {
@@ -65,7 +80,7 @@ export function NewSkillsDialog({ skills, installing, onInstall, onDismiss }: Pr
               <button
                 key={keyOf(skill)}
                 type="button"
-                onClick={() => toggle(skill)}
+                onClick={(event) => toggle(skill, event.shiftKey)}
                 className={cn(
                   "mb-1 flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors",
                   checked ? "bg-surface-active" : "hover:bg-surface-hover"
