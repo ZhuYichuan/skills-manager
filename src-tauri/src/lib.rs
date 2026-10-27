@@ -1033,6 +1033,7 @@ pub fn run() {
             commands::skills::detach_skill_source,
             commands::skills::batch_update_skills,
             commands::skills::dismiss_new_skills,
+            commands::skills::install_new_skill,
             commands::skills::cancel_batch_update,
             commands::skills::reimport_local_skill,
             commands::skills::relink_local_skill_source,

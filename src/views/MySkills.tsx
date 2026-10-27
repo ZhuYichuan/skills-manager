@@ -861,10 +861,11 @@ export function MySkills() {
     setInstallingNew(true);
     try {
       for (const skill of chosen) {
-        const tree = skill.branch
-          ? `${skill.source_ref_resolved}/tree/${skill.branch}/${skill.subpath}`
-          : `${skill.source_ref_resolved}/tree/${skill.subpath}`;
-        await api.installGit(tree);
+        await api.installNewSkill(
+          skill.source_ref_resolved,
+          skill.branch,
+          skill.subpath
+        );
       }
       toast.success(t("mySkills.newSkills.installed", { count: chosen.length }));
     } catch (error: unknown) {

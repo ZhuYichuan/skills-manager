@@ -1252,6 +1252,95 @@ pub async fn install_git(
     .await?
 }
 
+/// Build the reference for a skill the round discovered, without a tree URL.
+///
+/// A tree URL has to guess which segment is the branch and is only understood
+/// for GitHub-shaped URLs. The round already knows the Source, the branch and
+/// the subpath as separate values, so no parsing is needed — and a Source with
+/// no branch stays `None` instead of being handed the first path segment as a
+/// branch name.
+fn new_skill_source(
+    source_ref_resolved: &str,
+    branch: Option<&str>,
+    subpath: &str,
+) -> Result<RemoteRef, AppError> {
+    git_fetcher::validate_git_url(source_ref_resolved).map_err(AppError::git)?;
+    Ok(RemoteRef {
+        original_url: source_ref_resolved.to_string(),
+        clone_url: source_ref_resolved.to_string(),
+        branch: branch.filter(|branch| !branch.is_empty()).map(str::to_string),
+        subpath: source_membership::normalize_subpath(Some(subpath))
+            .filter(|subpath| !subpath.is_empty()),
+        locator: None,
+    })
+}
+
+/// Install one skill a round discovered, from the Source it came from.
+///
+/// Deliberately not routed through `install_git` with a tree URL: the round
+/// already holds the three values separately, and a branch-less Source or a
+/// GitLab/ssh URL does not survive that string form.
+///
+/// The round has just fetched this Source, so the cache is warm. `Reuse` takes
+/// that copy and only clones when the cache has gone; the fallback is the
+/// ordinary narrow clone.
+#[tauri::command]
+pub async fn install_new_skill(
+    source_ref_resolved: String,
+    branch: Option<String>,
+    subpath: String,
+    store: State<'_, Arc<SkillStore>>,
+    cancel_registry: State<'_, Arc<InstallCancelRegistry>>,
+) -> Result<(), AppError> {
+    let store = store.inner().clone();
+    let proxy_url = store.proxy_url();
+    let registry = cancel_registry.inner().clone();
+    let cancel_key = format!(
+        "install-new:{source_ref_resolved}#{}#{subpath}",
+        branch.as_deref().unwrap_or("")
+    );
+    let cancel = registry.register(&cancel_key);
+    let _cancel_guard = CancelRegistrationGuard::new(registry, cancel_key);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let source = new_skill_source(&source_ref_resolved, branch.as_deref(), &subpath)?;
+        let temp_dir = git_fetcher::clone_repo_ref_scoped_with(
+            &source.clone_url,
+            source.branch.as_deref(),
+            source.subpath.as_deref(),
+            Some(&cancel),
+            proxy_url.as_deref(),
+            None,
+            git_fetcher::CacheRefresh::Reuse,
+        )
+        .map_err(AppError::classify_git_error)?;
+
+        let install_result = (|| -> Result<(), AppError> {
+            let _lock =
+                RepoLock::acquire_foreground("install discovered skill").map_err(AppError::db)?;
+            let skill_dir = resolve_skill_dir(&temp_dir, source.subpath.as_deref(), None)?;
+            let revision = git_fetcher::get_head_revision(&temp_dir).map_err(AppError::git)?;
+            let result = installer::install_from_git_dir(&skill_dir, None).map_err(AppError::io)?;
+            let metadata = InstallSourceMetadata {
+                source_type: "git".to_string(),
+                source_ref: Some(source.original_url.clone()),
+                source_ref_resolved: Some(source.clone_url.clone()),
+                source_subpath: git_fetcher::relative_subpath(&temp_dir, &skill_dir),
+                source_branch: source.branch.clone(),
+                source_revision: Some(revision.clone()),
+                remote_revision: Some(revision),
+                update_status: "up_to_date".to_string(),
+            };
+            store_installed_skill_unlocked(&store, &result, &metadata, None)?;
+            Ok(())
+        })();
+
+        git_fetcher::cleanup_temp(&temp_dir);
+        install_result
+    })
+    .await?
+}
+
 #[tauri::command]
 pub async fn install_from_skillssh(
     source: String,
@@ -4851,6 +4940,29 @@ mod tests {
             tmp.path(),
         );
         tmp
+    }
+
+    /// The discovered skill's Source is built, not parsed out of a tree URL: a
+    /// missing branch must stay missing and the subpath must survive verbatim.
+    #[test]
+    fn an_installed_new_skill_keeps_its_branch_and_subpath_separate() {
+        let source = new_skill_source(
+            "https://gitlab.com/acme/skills.git",
+            None,
+            "skills/beta",
+        )
+        .unwrap();
+        assert_eq!(source.clone_url, "https://gitlab.com/acme/skills.git");
+        assert_eq!(source.branch, None, "no branch is not a branch named 'skills'");
+        assert_eq!(source.subpath.as_deref(), Some("skills/beta"));
+
+        let branched =
+            new_skill_source("git@gitlab.com:acme/skills.git", Some("next"), "skills/beta")
+                .unwrap();
+        assert_eq!(branched.branch.as_deref(), Some("next"));
+
+        let root = new_skill_source("https://example.com/acme/skills", None, "").unwrap();
+        assert_eq!(root.subpath, None, "the repository root is the whole checkout");
     }
 
     /// The key is the only comparison the frontend gets, so spellings that name

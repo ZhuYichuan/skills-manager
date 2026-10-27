@@ -422,6 +422,23 @@ export const cancelBatchUpdate = () => invoke<boolean>("cancel_batch_update");
 export const dismissNewSkills = (keys: string[]) =>
   invoke<void>("dismiss_new_skills", { keys });
 
+/**
+ * Install one skill the round discovered, from the Source and path it gave.
+ *
+ * Not a tree URL: the backend already has the branch and subpath separately,
+ * and a branch-less or non-GitHub Source does not survive the string form.
+ */
+export const installNewSkill = (
+  sourceRefResolved: string,
+  branch: string | null,
+  subpath: string
+) =>
+  invoke<void>("install_new_skill", {
+    sourceRefResolved,
+    branch,
+    subpath,
+  });
+
 export interface ReimportSkillResult {
   skill: ManagedSkill;
   /** Non-empty means nothing was changed — see UpdateSkillResult. */
