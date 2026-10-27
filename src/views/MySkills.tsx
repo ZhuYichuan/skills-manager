@@ -24,6 +24,7 @@ import {
   ChevronDown,
   ChevronRight,
   FolderTree,
+  FileWarning,
   Pencil,
   Share2,
   Tag,
@@ -44,6 +45,7 @@ import { TagRenameDialog } from "../components/TagRenameDialog";
 import { SkillDetailPanel } from "../components/SkillDetailPanel";
 import { MultiSelectToolbar } from "../components/MultiSelectToolbar";
 import { NewSkillsDialog } from "../components/NewSkillsDialog";
+import { PendingRemovalsDialog } from "../components/PendingRemovalsDialog";
 import { BatchTagDialog } from "../components/BatchTagDialog";
 import { BatchSyncAgentDialog } from "../components/BatchSyncAgentDialog";
 import { SyncDots } from "../components/SyncDots";
@@ -211,6 +213,12 @@ export function MySkills() {
   // Skills the Sources gained during the round. Offered, never installed.
   const [newSkills, setNewSkills] = useState<api.NewSkill[]>([]);
   const [installingNew, setInstallingNew] = useState(false);
+  // Skills whose last update was held back because it would delete files. The
+  // list is persisted by the backend, so it survives a restart and a closed
+  // dialog; the toolbar only offers the review when there is something in it.
+  const [pendingRemovals, setPendingRemovals] = useState<api.PendingRemovalGroup[]>([]);
+  const [reviewingRemovals, setReviewingRemovals] = useState(false);
+  const [approvingRemovals, setApprovingRemovals] = useState(false);
   const [toolToggles, setToolToggles] = useState<SkillToolToggle[] | null>(null);
   const [togglingToolKey, setTogglingToolKey] = useState<string | null>(null);
   const [togglingTarget, setTogglingTarget] = useState<{ skillId: string; tool: string } | null>(null);
@@ -243,6 +251,20 @@ export function MySkills() {
       .then((rows) => setConflictIds(new Set(rows.map((row) => row.skill_id))))
       .catch(() => setConflictIds(new Set()));
   }, [skills]);
+
+  const refreshPendingRemovals = useCallback(async () => {
+    // A failed read is not a reason to hide the library; it just means there
+    // is nothing new to offer until the next refresh.
+    const groups = await api.listPendingRemovals().catch(() => []);
+    setPendingRemovals(groups);
+    if (groups.length === 0) setReviewingRemovals(false);
+  }, []);
+
+  // `skills` changes after every update, delete and approve, which is exactly
+  // when a stored removal list can become stale or disappear.
+  useEffect(() => {
+    void refreshPendingRemovals();
+  }, [skills, refreshPendingRemovals]);
 
   const refreshAllTags = async () => {
     try {
@@ -856,6 +878,30 @@ export function MySkills() {
     }
   };
 
+  const handleApproveRemovals = async (skillIds: string[]) => {
+    if (skillIds.length === 0) return;
+    setApprovingRemovals(true);
+    try {
+      const result = await api.approveRemovals(skillIds);
+      if (result.approved > 0) {
+        toast.success(t("mySkills.pendingRemovals.approved", { count: result.approved }));
+      }
+      if (result.failed.length > 0) {
+        // The list is refreshed below, including when the only failure was a
+        // token that no longer matches: the new question has to be readable.
+        toast.error(
+          t("mySkills.pendingRemovals.approveFailed", { count: result.failed.length })
+        );
+      }
+    } catch (error: unknown) {
+      toast.error(getErrorMessage(error, t("common.error")));
+    } finally {
+      setApprovingRemovals(false);
+      await refreshPendingRemovals();
+      await refreshManagedSkills();
+    }
+  };
+
   const installChosenNewSkills = async (chosen: api.NewSkill[]) => {
     if (chosen.length === 0) return;
     setInstallingNew(true);
@@ -1302,6 +1348,10 @@ export function MySkills() {
     () => updatableSkills(skills).length,
     [skills]
   );
+  const pendingRemovalSkillCount = useMemo(
+    () => new Set(pendingRemovals.map((group) => group.skill_id)).size,
+    [pendingRemovals]
+  );
   const refreshableSelectedCount = useMemo(
     () => skills.filter((skill) => selectedIds.has(skill.id) && canRefresh(skill)).length,
     [skills, selectedIds]
@@ -1455,6 +1505,16 @@ export function MySkills() {
                 className="mr-2 rounded-md px-2.5 py-2 text-[13px] font-medium text-muted transition-colors hover:bg-surface-hover hover:text-secondary"
               >
                 {t("mySkills.cancelBatchUpdate")}
+              </button>
+            )}
+            {pendingRemovalSkillCount > 0 && (
+              <button
+                onClick={() => setReviewingRemovals(true)}
+                disabled={batchUpdating || approvingRemovals}
+                className="mr-2 inline-flex items-center gap-1 rounded-md px-3 py-2 text-[13px] font-medium text-amber-600 transition-colors hover:bg-amber-500/10 disabled:opacity-50 dark:text-amber-400"
+              >
+                <FileWarning className="h-3.5 w-3.5" />
+                {t("mySkills.pendingRemovals.review", { count: pendingRemovalSkillCount })}
               </button>
             )}
             <span aria-hidden="true" className="mx-1 h-5 w-px shrink-0 self-center bg-border-subtle" />
@@ -2304,6 +2364,14 @@ export function MySkills() {
           }
         }}
       />
+      {reviewingRemovals && (
+        <PendingRemovalsDialog
+          groups={pendingRemovals}
+          approving={approvingRemovals}
+          onApprove={handleApproveRemovals}
+          onClose={() => setReviewingRemovals(false)}
+        />
+      )}
       <NewSkillsDialog
         skills={newSkills}
         installing={installingNew}

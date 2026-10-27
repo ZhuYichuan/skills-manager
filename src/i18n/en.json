@@ -439,7 +439,20 @@
       "tagDeleted": "Tag deleted",
       "deleteConfirm": "Remove the tag \"{{tag}}\" from all skills?"
     },
-      "newSkills": {
+      "pendingRemovals": {
+    "review": "Review {{count}}",
+    "title": "{{count}} skill(s) would delete files",
+    "hint": "These updates would remove {{count}} file(s). Nothing is deleted until you select a skill and approve.",
+    "paths": "{{count}} file(s)",
+    "library": "Library",
+    "expand": "Show files",
+    "collapse": "Hide files",
+    "approve": "Approve selected ({{count}})",
+    "close": "Not now",
+    "approved": "{{count}} skill(s) updated",
+    "approveFailed": "{{count}} skill(s) were not approved; the list has been refreshed — review it again"
+  },
+  "newSkills": {
         "title": "{{count}} new skill(s) in your sources",
         "hint": "Your library does not have these yet. Nothing is installed until you pick one.",
         "install": "Install {{count}}",

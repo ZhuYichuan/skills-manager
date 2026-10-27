@@ -433,7 +433,20 @@
       "tagDeleted": "標籤已刪除",
       "deleteConfirm": "確定從所有技能中移除標籤「{{tag}}」嗎？"
     },
-      "newSkills": {
+      "pendingRemovals": {
+    "review": "審閱 {{count}}",
+    "title": "{{count}} 個技能會刪除檔案",
+    "hint": "這些更新會移除 {{count}} 個檔案。勾選並批准之前不會刪除任何東西。",
+    "paths": "{{count}} 個檔案",
+    "library": "庫目錄",
+    "expand": "展開檔案",
+    "collapse": "收起檔案",
+    "approve": "批准所選（{{count}}）",
+    "close": "以後再說",
+    "approved": "已更新 {{count}} 個技能",
+    "approveFailed": "{{count}} 個技能未批准；清單已刷新，請再看一次"
+  },
+  "newSkills": {
         "title": "來源裡有 {{count}} 個新技能",
         "hint": "你的技能庫還沒有它們。不勾選就不會安裝。",
         "install": "安裝 {{count}} 個",

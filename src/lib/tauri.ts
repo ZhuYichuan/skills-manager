@@ -351,6 +351,45 @@ export interface PendingRemoval {
   path: string;
 }
 
+/**
+ * One skill's stored removals in one location. A skill appears once per
+ * location because that is how the panel groups the paths, while approval is
+ * still per skill and covers all of them.
+ */
+export interface PendingRemovalGroup {
+  skill_id: string;
+  skill_name: string;
+  /** The Source the skill came from, in the form `source_ref_resolved` stores. */
+  source: string;
+  /** The revision the stored list describes. */
+  revision: string;
+  /** `"library"`, or the agent key whose copy holds it. */
+  location: string;
+  paths: string[];
+}
+
+export interface FailedRemoval {
+  name: string;
+  message: string;
+}
+
+export interface ApproveRemovalsResult {
+  approved: number;
+  failed: FailedRemoval[];
+}
+
+/** Every skill the last update held back, with the paths it would delete. */
+export const listPendingRemovals = () =>
+  invoke<PendingRemovalGroup[]>("list_pending_removals");
+
+/**
+ * Approve the stored removal list for each skill. Each one goes through the
+ * normal single-skill update with the token it was stored with; a failure is
+ * reported per skill, never rolled back across skills.
+ */
+export const approveRemovals = (skillIds: string[]) =>
+  invoke<ApproveRemovalsResult>("approve_removals", { skillIds });
+
 /** `approvedRemovals` carries back `removal_approval` from a declined call. */
 export const updateSkill = (skillId: string, approvedRemovals?: string | null) =>
   invoke<UpdateSkillResult>("update_skill", {
