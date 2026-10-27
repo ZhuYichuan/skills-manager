@@ -4,7 +4,7 @@
 
 **Blocked by:** 01–05（已合并）
 
-**Status:** ready-for-agent
+**Status:** done (997291c, 49ffe7a, cea857b, 4d0d93e)
 
 ## Critical 1：扫描必须读整棵树，不是 worktree
 
