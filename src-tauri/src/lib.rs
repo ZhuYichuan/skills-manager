@@ -1029,6 +1029,8 @@ pub fn run() {
             commands::skills::check_skill_update,
             commands::skills::check_all_skill_updates,
             commands::skills::update_skill,
+            commands::skills::list_pending_removals,
+            commands::skills::approve_removals,
             commands::skills::repoint_skill_source,
             commands::skills::detach_skill_source,
             commands::skills::batch_update_skills,
