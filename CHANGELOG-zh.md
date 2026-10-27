@@ -5,6 +5,18 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.43.1] - 2026-10-27
+
+### 发布概览
+- 技能库没变时，你在 Agent 目录里改过的副本不再被日常同步覆盖；CLI 的 `skills check` 现在会检查从本地文件夹安装的 Skill。
+
+### 用户可见更新
+- **技能库没变时，改过的副本不再被覆盖** — 以复制方式部署的 Skill，在 PresetBar 应用 Preset、从「添加 Skills」弹层添加、批量部署、安装后的同步，以及内容没变的更新或重新导入时，都会被重新复制一遍，你在 Agent 目录里做的修改随之丢失。现在只要技能库的内容和部署时一样，这些操作就不动副本，和启动时的同步一致。技能库真的更新时，副本仍会被替换，和以前一样。这样的副本要等下次内容变化，或取消部署后重新部署，才会改成链接（#598）。
+- **`skills-manager-cli skills check` 会检查本地 Skill** — 以前对从本地文件夹安装或导入的 Skill 直接跳过，输出 `skipped: true`。现在和应用一样，拿它和源文件夹比对，报告 `up_to_date`、`update_available` 或 `source_missing`。本地检查每次都实际执行，更新检查的缓存只用于 Git 来源。来自网站的 Skill 仍然跳过（#597、#590）。
+
+### 开发者与治理更新
+- 启动同步用来判断「已部署的副本是否仍是最新」的检查，抽成了一个函数 `recorded_target_is_current`，五个同步入口都调用它。只看调用方 Agent 自己的记录，所以多个 Agent 共用一个技能目录时（amp 与 replit、cline 与 warp），行为和以前一样。副本的位置上放着文件或指向别处的链接时，启动同步现在会报告拒绝写入，而不是静默跳过（#598）。
+- `skills/manage-skills` 补充说明：本地 Skill 的 `check` 比对的是什么，`update_available` 和 `source_missing` 是什么意思（#597）。
 ## [1.43.0] - 2026-10-21
 
 ### 发布概览

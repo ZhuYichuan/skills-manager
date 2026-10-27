@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.43.1] - 2026-10-27
+
+### Release Overview
+- Copies you edited in an agent's folder are no longer overwritten by routine syncs while the library is unchanged, and the CLI's `skills check` now checks skills installed from a local folder.
+
+### User-facing
+- **Edited copies stay put while the library is unchanged** — For skills deployed as copies, applying a preset from the PresetBar, adding skills from the Add Skills sheet, batch deploys, the sync after an install, and an update or reimport that changed nothing all copied the skill again, which threw away edits made in the agent's folder. These now leave the copy alone while the library's content is the same as when it was deployed, as the startup sync already did. When the library does change, the copy is still replaced, as before. Such a copy switches to a link at the next content change, or when you undeploy and deploy the skill again (#598).
+- **`skills-manager-cli skills check` checks local skills** — It skipped skills installed from a local folder or imported, and reported them with `skipped: true`. It now compares them with their source folder, as the app does, and reports `up_to_date`, `update_available` or `source_missing`. Local checks always run; the update-check cache is only for Git sources. Skills from websites are still skipped (#597, #590).
+
+### Developer & Governance
+- The startup sync's check for whether a deployed copy is still current is now one function, `recorded_target_is_current`, and all five sync paths call it. Only the calling agent's own record counts, so agents sharing one skills folder (amp and replit, cline and warp) behave as before. When a file or a foreign link sits where the copy should be, the startup sync now reports the refusal instead of skipping it silently (#598).
+- `skills/manage-skills` now explains what `check` compares for a local skill and what `update_available` and `source_missing` mean (#597).
 ## [1.43.0] - 2026-10-21
 
 ### Release Overview
