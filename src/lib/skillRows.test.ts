@@ -25,6 +25,7 @@ const skill = (id: string): ManagedSkill => ({
   status: "ok",
   targets: [],
   preset_ids: [],
+  move_candidates: [],
   tags: [],
 });
 
