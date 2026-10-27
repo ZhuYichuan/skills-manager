@@ -2093,8 +2093,7 @@ fn collect_new_skills(
     let identity = source.identity();
     let mut found = Vec::new();
     for skill in source_membership::discover(checkout, known_subpaths) {
-        if skill.subpath.is_empty()
-            || moved_to.contains(&skill.subpath)
+        if moved_to.contains(&skill.subpath)
             || skill.also_at.iter().any(|path| moved_to.contains(path))
         {
             continue;
