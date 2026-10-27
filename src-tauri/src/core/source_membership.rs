@@ -23,6 +23,7 @@
 //! the same checkout pay for the walk per skill; caching is deliberately not
 //! part of this module's state.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
@@ -104,6 +105,92 @@ pub enum Placement {
     /// Nowhere in this checkout. Not an error — a real answer, and one that
     /// stops the "retry the update forever" loop.
     Gone,
+}
+
+/// A skill the Source holds that this library does not.
+///
+/// The other half of "where is my skill": `locate` answers for one skill the
+/// library already has, `discover` answers for the ones it does not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveredSkill {
+    /// Path relative to the checkout root, in the form `source_subpath` takes.
+    pub subpath: String,
+    /// The name to show and to install under: frontmatter first, directory last.
+    pub name: String,
+    /// Every path the same skill was found at, when a repository ships one skill
+    /// under several trees (`.claude/skills/x` and `.agents/skills/x`). The first
+    /// entry is `subpath`; the rest exist so a caller can tell a duplicate from a
+    /// genuinely new skill.
+    pub also_at: Vec<String>,
+}
+
+/// Skills in `checkout` that `installed_subpaths` does not cover.
+///
+/// Deliberately keyed by name after the first sighting: a repository that keeps
+/// one skill in two trees (a Claude layout and an agents layout) is one new
+/// skill, not two prompts. Names are compared case-insensitively, because two
+/// directories differing only by case are the same skill in practice.
+///
+/// `installed_subpaths` is what the library already has from this Source; a
+/// directory whose subpath is in there is not new, whatever its name says — a
+/// rename is `locate`'s question, not this one.
+pub fn discover(checkout: &Path, installed_subpaths: &[String]) -> Vec<DiscoveredSkill> {
+    let installed: HashSet<&str> = installed_subpaths.iter().map(String::as_str).collect();
+    let mut found: Vec<DiscoveredSkill> = Vec::new();
+    let mut by_name: HashMap<String, usize> = HashMap::new();
+
+    for entry in WalkDir::new(checkout)
+        .max_depth(MAX_SCAN_DEPTH)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(keep_walking)
+        .flatten()
+    {
+        if !entry.file_type().is_dir() {
+            continue;
+        }
+        let dir = entry.path();
+        if !skill_metadata::is_valid_skill_dir(dir) {
+            continue;
+        }
+        let Some(subpath) = relative_subpath(checkout, dir) else {
+            continue;
+        };
+        if installed.contains(subpath.as_str()) {
+            continue;
+        }
+
+        let name = skill_metadata::parse_skill_md(dir)
+            .name
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| {
+                subpath
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(subpath.as_str())
+                    .to_string()
+            });
+
+        match by_name.get(&name.to_lowercase()) {
+            Some(&at) => {
+                if !found[at].also_at.contains(&subpath) {
+                    found[at].also_at.push(subpath);
+                }
+            }
+            None => {
+                by_name.insert(name.to_lowercase(), found.len());
+                found.push(DiscoveredSkill {
+                    subpath,
+                    name,
+                    also_at: Vec::new(),
+                });
+            }
+        }
+    }
+
+    found.sort_by(|a, b| a.subpath.cmp(&b.subpath));
+    found
 }
 
 /// Where does `skill` sit in `checkout`?
@@ -641,6 +728,70 @@ mod tests {
         let record = stored("alpha", Some("skills/alpha"), Some("deadbeef"));
 
         assert_eq!(locate(&record, checkout.path()), Placement::Gone);
+    }
+
+    fn write_skill(dir: &Path, frontmatter_name: Option<&str>) {
+        std::fs::create_dir_all(dir).unwrap();
+        let body = match frontmatter_name {
+            Some(name) => format!("---\nname: {name}\n---\nbody\n"),
+            None => "body\n".to_string(),
+        };
+        std::fs::write(dir.join("SKILL.md"), body).unwrap();
+    }
+
+    #[test]
+    fn two_trees_holding_one_skill_are_one_new_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = tmp.path();
+        write_skill(&checkout.join(".claude/skills/captions"), Some("captions"));
+        write_skill(&checkout.join(".agents/skills/captions"), Some("captions"));
+
+        let found = discover(checkout, &[]);
+
+        assert_eq!(found.len(), 1, "one skill, two layouts");
+        assert_eq!(found[0].name, "captions");
+        assert_eq!(found[0].also_at.len(), 1, "the second tree is recorded, not listed");
+    }
+
+    #[test]
+    fn a_subpath_the_library_already_has_is_not_new() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = tmp.path();
+        write_skill(&checkout.join("skills/known"), Some("known"));
+        write_skill(&checkout.join("skills/fresh"), Some("fresh"));
+
+        let found = discover(checkout, &["skills/known".to_string()]);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].subpath, "skills/fresh");
+    }
+
+    #[test]
+    fn the_name_falls_back_to_the_directory_when_the_frontmatter_is_silent() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(&tmp.path().join("skills/nameless"), None);
+
+        let found = discover(tmp.path(), &[]);
+
+        assert_eq!(found[0].name, "nameless");
+    }
+
+    #[test]
+    fn names_that_differ_only_by_case_are_one_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = tmp.path();
+        write_skill(&checkout.join("a/Captions"), Some("Captions"));
+        write_skill(&checkout.join("b/captions"), Some("captions"));
+
+        assert_eq!(discover(checkout, &[]).len(), 1);
+    }
+
+    #[test]
+    fn git_metadata_holds_no_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(&tmp.path().join(".git/fake"), Some("fake"));
+
+        assert!(discover(tmp.path(), &[]).is_empty());
     }
 
     #[test]
