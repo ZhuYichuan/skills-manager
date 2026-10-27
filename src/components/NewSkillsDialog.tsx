@@ -25,7 +25,8 @@ export function NewSkillsDialog({ skills, installing, onInstall, onDismiss }: Pr
 
   if (skills.length === 0) return null;
 
-  const keyOf = (skill: NewSkill) => `${skill.source_ref_resolved}#${skill.subpath}`;
+  // The key is the backend's: it folds URL spellings and carries the branch.
+  const keyOf = (skill: NewSkill) => skill.key;
   const toggle = (skill: NewSkill) => {
     const key = keyOf(skill);
     setChosen((prev) => {

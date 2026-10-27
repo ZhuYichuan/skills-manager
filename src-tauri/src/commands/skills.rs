@@ -218,6 +218,9 @@ pub struct BatchUpdateSkillsResult {
     /// because retrying cannot help: the advice is to detach the source or
     /// delete the skill.
     pub gone_sources: Vec<String>,
+    /// Skills the Sources gained that the library does not hold. Offered by the
+    /// UI; never installed by the round.
+    pub new_skills: Vec<NewSkill>,
 }
 
 /// One skill that moved upstream, with every place the checkout proposes for it.
@@ -1890,18 +1893,25 @@ pub async fn reimport_local_skill(
     .await?
 }
 
-/// Settings key holding the new skills the user has said no to, as
-/// `"<source>#<subpath>"`. A prompt that returns every round is a prompt the
-/// user learns to dismiss without reading.
+/// Settings key holding the new skills the user has said no to, oldest first.
+/// A prompt that returns every round is a prompt the user learns to dismiss
+/// without reading.
 const DISMISSED_NEW_SKILLS: &str = "dismissed_new_skills";
 
-fn dismissed_new_skills(store: &SkillStore) -> HashSet<String> {
+/// Upper bound on the refusal list.
+///
+/// Pruning to "keys still in this round's trees" would forget every Source the
+/// round did not visit, and a skill upstream deleted today can reappear. A
+/// bounded oldest-first list keeps the record from growing forever while
+/// forgetting only what the user has not been asked about in a long time.
+const MAX_DISMISSED_NEW_SKILLS: usize = 500;
+
+fn dismissed_new_skills(store: &SkillStore) -> Vec<String> {
     store
         .get_setting(DISMISSED_NEW_SKILLS)
         .ok()
         .flatten()
         .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
-        .map(|keys| keys.into_iter().collect())
         .unwrap_or_default()
 }
 
@@ -1912,41 +1922,113 @@ fn remember_dismissed_new_skills(
 ) -> Result<(), AppError> {
     let mut current = dismissed_new_skills(store);
     let before = current.len();
-    current.extend(keys);
+    for key in keys {
+        if !current.contains(&key) {
+            current.push(key);
+        }
+    }
     if current.len() == before {
         return Ok(());
     }
-    let mut all: Vec<String> = current.into_iter().collect();
-    all.sort();
+    if current.len() > MAX_DISMISSED_NEW_SKILLS {
+        let overflow = current.len() - MAX_DISMISSED_NEW_SKILLS;
+        current.drain(..overflow);
+    }
     store
         .set_setting(
             DISMISSED_NEW_SKILLS,
-            &serde_json::to_string(&all).unwrap_or_default(),
+            &serde_json::to_string(&current).unwrap_or_default(),
         )
         .map_err(AppError::db)
 }
 
-fn new_skill_key(source: &str, subpath: &str) -> String {
-    format!("{source}#{subpath}")
+/// Stable key for a discovered skill: the Source's identity (which folds `.git`
+/// and a trailing slash, and carries the branch) plus the name in lower case.
+/// Name rather than subpath, because one repository shipping the same skill in
+/// two trees is one prompt; the frontend copies this key and never builds one.
+fn new_skill_key(source: &RemoteIdentity, name: &str) -> String {
+    format!("{}#{}", source.key(), name.trim().to_lowercase())
 }
 
 /// Every subpath the library already holds, per Source. Read once per round
 /// rather than once per group: the scan needs the whole Source's inventory to
 /// tell a new skill from an installed one.
-fn installed_subpaths_by_source(store: &SkillStore) -> HashMap<String, Vec<String>> {
-    let mut out: HashMap<String, Vec<String>> = HashMap::new();
-    if let Ok(skills) = store.get_all_skills() {
-        for skill in skills {
-            if let (Some(source), Some(subpath)) = (skill.source_ref_resolved, skill.source_subpath) {
-                out.entry(source).or_default().push(subpath);
-            }
-        }
+///
+/// Keyed by [`RemoteIdentity`], not by the URL string: `.git`, a trailing slash
+/// and the branch are part of the question, and comparing URLs by spelling is
+/// how an installed skill came back as new and overwrote itself on install.
+fn installed_subpaths_by_source(
+    store: &SkillStore,
+) -> Result<HashMap<RemoteIdentity, Vec<String>>, AppError> {
+    let mut out: HashMap<RemoteIdentity, Vec<String>> = HashMap::new();
+    for skill in store.get_all_skills().map_err(AppError::db)? {
+        let Some(subpath) = skill.source_subpath.as_deref() else {
+            continue;
+        };
+        let Ok(source) = RemoteRef::from_skill(&skill) else {
+            continue;
+        };
+        let Some(subpath) = source_membership::normalize_subpath(Some(subpath)) else {
+            continue;
+        };
+        out.entry(source.identity()).or_default().push(subpath);
     }
-    out
+    Ok(out)
 }
 
-/// Stop offering these skills. The round filters them out from then on, until
-/// the Source drops that subpath and adds it again.
+/// The skills this checkout holds that the library does not, minus the ones
+/// this round already answered a different way.
+///
+/// A member `locate` reports as `Moved` contributes its candidate subpaths to
+/// the exclusion set. Without that, a rename arrives twice in one round — as a
+/// move and as a new skill — and installing the second would rewrite the
+/// existing record's `source_subpath`, which only the user may do.
+///
+/// `seen` deduplicates across groups: one name from one Source is one prompt,
+/// even if two checkouts of it are scanned.
+fn collect_new_skills(
+    source: &RemoteRef,
+    checkout: &Path,
+    members: &[(String, SkillRecord)],
+    known_subpaths: &[String],
+    dismissed: &HashSet<String>,
+    seen: &mut HashSet<(RemoteIdentity, String)>,
+) -> Vec<NewSkill> {
+    let mut moved_to: HashSet<String> = HashSet::new();
+    for (_, skill) in members {
+        if let Placement::Moved { candidates } = source_membership::locate(skill, checkout) {
+            moved_to.extend(candidates.into_iter().map(|candidate| candidate.subpath));
+        }
+    }
+
+    let identity = source.identity();
+    let mut found = Vec::new();
+    for skill in source_membership::discover(checkout, known_subpaths) {
+        if skill.subpath.is_empty()
+            || moved_to.contains(&skill.subpath)
+            || skill.also_at.iter().any(|path| moved_to.contains(path))
+        {
+            continue;
+        }
+        let key = new_skill_key(&identity, &skill.name);
+        if dismissed.contains(&key) {
+            continue;
+        }
+        if !seen.insert((identity.clone(), skill.name.to_lowercase())) {
+            continue;
+        }
+        found.push(NewSkill {
+            name: skill.name,
+            subpath: skill.subpath,
+            source_ref_resolved: source.clone_url.clone(),
+            branch: source.branch.clone(),
+            key,
+        });
+    }
+    found
+}
+
+/// Stop offering these skills. The round filters them out from then on.
 #[tauri::command]
 pub fn dismiss_new_skills(
     keys: Vec<String>,
@@ -2058,6 +2140,7 @@ struct RoundTally {
     held_back_paths: usize,
     moved_sources: Vec<MovedSource>,
     gone_sources: Vec<String>,
+    new_skills: Vec<NewSkill>,
     failed: Vec<String>,
 }
 
@@ -2090,6 +2173,7 @@ impl RoundTally {
             held_back_paths: self.held_back_paths,
             moved_sources: self.moved_sources,
             gone_sources: self.gone_sources,
+            new_skills: self.new_skills,
         }
     }
 }
@@ -2135,9 +2219,21 @@ pub fn run_update_round(
         return Ok(tally.into_result(true));
     }
 
-    let installed = installed_subpaths_by_source(store);
-    let dismissed = dismissed_new_skills(store);
-    let mut new_skills: Vec<NewSkill> = Vec::new();
+    // A library read that fails means every stored subpath is unknown, which
+    // would present the whole library as new. Skip discovery for the round
+    // instead: the update itself does not depend on it.
+    let installed = match installed_subpaths_by_source(store) {
+        Ok(installed) => Some(installed),
+        Err(error) => {
+            log::warn!(
+                "skipping new-skill discovery: cannot read the library: {}",
+                error.message
+            );
+            None
+        }
+    };
+    let dismissed: HashSet<String> = dismissed_new_skills(store).into_iter().collect();
+    let mut seen_new_skills: HashSet<(RemoteIdentity, String)> = HashSet::new();
 
     let (groups, ungrouped) = group_by_source(loaded);
     // Local and imported sources share nothing and have no remote to
@@ -2249,22 +2345,21 @@ pub fn run_update_round(
 
         // The checkout is on disk for the length of this group: the cheapest
         // moment there will ever be to see which skills the Source gained.
-        if let Some(checkout) = &scanned {
+        if let (Some(checkout), Some(installed)) = (&scanned, &installed) {
             if let Some((_, any_member)) = members.first() {
                 if let Ok(source) = RemoteRef::from_skill(any_member) {
-                    let held = installed.get(&source.clone_url).cloned().unwrap_or_default();
-                    for found in source_membership::discover(checkout, &held) {
-                        let key = new_skill_key(&source.clone_url, &found.subpath);
-                        if dismissed.contains(&key) {
-                            continue;
-                        }
-                        new_skills.push(NewSkill {
-                            name: found.name,
-                            subpath: found.subpath,
-                            source_ref_resolved: source.clone_url.clone(),
-                            branch: source.branch.clone(),
-                        });
-                    }
+                    let known_subpaths = installed
+                        .get(&source.identity())
+                        .cloned()
+                        .unwrap_or_default();
+                    tally.new_skills.extend(collect_new_skills(
+                        &source,
+                        checkout,
+                        &members,
+                        &known_subpaths,
+                        &dismissed,
+                        &mut seen_new_skills,
+                    ));
                 }
             }
         }
@@ -2849,10 +2944,13 @@ pub async fn repoint_skill_source(
 #[derive(Debug, Clone, Serialize)]
 pub struct NewSkill {
     pub name: String,
-    /// Where it sits in the repository, ready to be turned into a tree URL.
+    /// Where it sits in the repository, the form `source_subpath` takes.
     pub subpath: String,
     pub source_ref_resolved: String,
     pub branch: Option<String>,
+    /// Stable selection and dismissal key, built here so the UI never has to
+    /// decide which URL spellings are the same Source.
+    pub key: String,
 }
 
 pub struct PreparedUpdate {
@@ -4713,12 +4811,72 @@ mod tests {
         (id.to_string(), skill)
     }
 
-    /// The whole point of the batch grouping: skills installed from different
-    /// subdirectories of one repository share a single resolution and fetch.
+    fn git(args: &[&str], cwd: &Path) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// A checkout with a committed tree, which is what discovery reads.
+    fn git_checkout(skills: &[&str]) -> TempDir {
+        let tmp = tempdir().unwrap();
+        for skill in skills {
+            let name = skill.rsplit('/').next().unwrap();
+            let dir = tmp.path().join(skill);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: fixture\n---\n"),
+            )
+            .unwrap();
+        }
+        git(&["init", "-q"], tmp.path());
+        git(&["add", "-A"], tmp.path());
+        git(
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "fixture",
+            ],
+            tmp.path(),
+        );
+        tmp
+    }
+
+    /// The key is the only comparison the frontend gets, so spellings that name
+    /// one Source must fold to one key, and the branch must not disappear.
+    #[test]
+    fn a_new_skill_key_folds_spellings_and_keeps_the_branch() {
+        let plain = RemoteRef::from_url("https://example.com/acme/skills");
+        let dotted = RemoteRef::from_url("https://example.com/acme/skills.git");
+        let slashed = RemoteRef::from_url("https://example.com/acme/skills/");
+        let key = new_skill_key(&plain.identity(), "Fresh");
+
+        assert_eq!(key, new_skill_key(&dotted.identity(), "fresh"));
+        assert_eq!(key, new_skill_key(&slashed.identity(), "fresh"));
+
+        let mut next = plain.clone();
+        next.branch = Some("next".to_string());
+        assert_ne!(key, new_skill_key(&next.identity(), "fresh"));
+    }
+
+    /// A refusal is remembered, and the list has a ceiling so a library used for
+    /// years cannot grow it without bound.
     #[test]
     fn a_refused_new_skill_is_not_offered_again() {
         let repo = test_repo();
-        let key = new_skill_key("https://example.com/acme/skills.git", "skills/fresh");
+        let identity = RemoteRef::from_url("https://example.com/acme/skills.git").identity();
+        let key = new_skill_key(&identity, "fresh");
 
         remember_dismissed_new_skills(&repo.store, vec![key.clone()]).unwrap();
         assert!(dismissed_new_skills(&repo.store).contains(&key));
@@ -4726,6 +4884,86 @@ mod tests {
         // Refusing twice is not two entries.
         remember_dismissed_new_skills(&repo.store, vec![key.clone()]).unwrap();
         assert_eq!(dismissed_new_skills(&repo.store).len(), 1);
+
+        let overflow = (0..=MAX_DISMISSED_NEW_SKILLS)
+            .map(|index| format!("{key}-{index}"))
+            .collect();
+        remember_dismissed_new_skills(&repo.store, overflow).unwrap();
+        let all = dismissed_new_skills(&repo.store);
+        assert_eq!(all.len(), MAX_DISMISSED_NEW_SKILLS);
+        assert!(!all.contains(&key), "the oldest entry is the one dropped");
+        assert!(all.contains(&format!("{key}-{MAX_DISMISSED_NEW_SKILLS}")));
+    }
+
+    /// The bug the ticket's first acceptance test names: a renamed skill is
+    /// locate's answer, and must not also be offered as a new install. That
+    /// install would rewrite the existing record's source path.
+    #[test]
+    fn a_rename_is_not_also_offered_as_a_new_skill() {
+        let checkout = git_checkout(&["skills/alpha", "skills/beta"]);
+        let record = stored(
+            "alpha",
+            "https://example.com/acme/skills",
+            None,
+            Some("skills/old-alpha"),
+        )
+        .1;
+        let source = RemoteRef::from_skill(&record).unwrap();
+        let members = vec![("alpha".to_string(), record)];
+        let mut seen = HashSet::new();
+
+        let found = collect_new_skills(
+            &source,
+            checkout.path(),
+            &members,
+            &[],
+            &HashSet::new(),
+            &mut seen,
+        );
+
+        assert_eq!(
+            found.iter().map(|skill| skill.name.as_str()).collect::<Vec<_>>(),
+            vec!["beta"]
+        );
+    }
+
+    /// `.git` and a trailing slash describe one repository. Comparing the
+    /// stored URL as a string missed that, so an installed skill came back as
+    /// new and installing it would overwrite the live directory.
+    #[test]
+    fn url_spellings_of_one_source_do_not_produce_a_second_prompt() {
+        let repo = test_repo();
+        let checkout = git_checkout(&["skills/alpha", "skills/beta"]);
+        let installed = stored(
+            "alpha",
+            "https://example.com/acme/skills.git",
+            None,
+            Some("skills/alpha"),
+        )
+        .1;
+        repo.store.insert_skill(&installed).unwrap();
+
+        let by_source = installed_subpaths_by_source(&repo.store).unwrap();
+        let source = RemoteRef::from_url("https://example.com/acme/skills/");
+        let known = by_source
+            .get(&source.identity())
+            .cloned()
+            .expect("the same remote, however it is spelled");
+
+        let mut seen = HashSet::new();
+        let found = collect_new_skills(
+            &source,
+            checkout.path(),
+            &[],
+            &known,
+            &HashSet::new(),
+            &mut seen,
+        );
+
+        assert_eq!(
+            found.iter().map(|skill| skill.name.as_str()).collect::<Vec<_>>(),
+            vec!["beta"]
+        );
     }
 
     #[test]

@@ -880,7 +880,7 @@ export function MySkills() {
     setNewSkills([]);
     // Remembered so the next round does not ask about the same ones again.
     void api
-      .dismissNewSkills(offered.map((skill) => `${skill.source_ref_resolved}#${skill.subpath}`))
+      .dismissNewSkills(offered.map((skill) => skill.key))
       .catch((error: unknown) => console.error("Failed to remember dismissal:", error));
   };
 

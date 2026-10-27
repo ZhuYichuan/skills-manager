@@ -57,6 +57,19 @@ impl std::hash::Hash for RemoteIdentity {
     }
 }
 
+impl RemoteIdentity {
+    /// A stable string for a setting or a UI key. Folded exactly like equality
+    /// and carries the branch, so two spellings that `==` treats as one Source
+    /// never produce two keys — and a branch is never silently dropped.
+    pub fn key(&self) -> String {
+        format!(
+            "{}#{}",
+            comparison_key(&self.clone_url),
+            self.branch.as_deref().unwrap_or("")
+        )
+    }
+}
+
 impl RemoteRef {
     pub fn from_url(url: &str) -> Self {
         let trimmed = url.trim().to_string();

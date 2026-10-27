@@ -367,10 +367,15 @@ export const repointSkillSource = (skillId: string, subpath: string) =>
 
 export interface NewSkill {
   name: string;
-  /** Where it sits in the repository, used to build the tree URL it installs from. */
+  /** Where it sits in the repository, the form `source_subpath` takes. */
   subpath: string;
   source_ref_resolved: string;
   branch: string | null;
+  /**
+   * Stable selection and dismissal key from the backend: Source identity
+   * (URL spellings folded, branch included) plus the name. Never rebuild it.
+   */
+  key: string;
 }
 
 export interface BatchUpdateSkillsResult {
