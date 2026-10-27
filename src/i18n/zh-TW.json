@@ -433,6 +433,13 @@
       "tagDeleted": "標籤已刪除",
       "deleteConfirm": "確定從所有技能中移除標籤「{{tag}}」嗎？"
     },
+      "newSkills": {
+        "title": "來源裡有 {{count}} 個新技能",
+        "hint": "你的技能庫還沒有它們。不勾選就不會安裝。",
+        "install": "安裝 {{count}} 個",
+        "notNow": "以後再說",
+        "installed": "已安裝 {{count}} 個技能"
+      },
     "selectMode": "多選",
     "selectedCount": "已選 {{count}} 個",
     "selectHint": "點擊 Skill 開始選擇",

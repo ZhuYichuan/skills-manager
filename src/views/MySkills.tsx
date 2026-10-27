@@ -43,6 +43,7 @@ import { ConfirmDialog } from "../components/ConfirmDialog";
 import { TagRenameDialog } from "../components/TagRenameDialog";
 import { SkillDetailPanel } from "../components/SkillDetailPanel";
 import { MultiSelectToolbar } from "../components/MultiSelectToolbar";
+import { NewSkillsDialog } from "../components/NewSkillsDialog";
 import { BatchTagDialog } from "../components/BatchTagDialog";
 import { BatchSyncAgentDialog } from "../components/BatchSyncAgentDialog";
 import { SyncDots } from "../components/SyncDots";
@@ -207,6 +208,9 @@ export function MySkills() {
   // A long round with only a spinner reads as "stuck": the round reports each
   // skill it finishes, so the button can say how far it has got.
   const [batchProgress, setBatchProgress] = useState<{ done: number; total: number } | null>(null);
+  // Skills the Sources gained during the round. Offered, never installed.
+  const [newSkills, setNewSkills] = useState<api.NewSkill[]>([]);
+  const [installingNew, setInstallingNew] = useState(false);
   const [toolToggles, setToolToggles] = useState<SkillToolToggle[] | null>(null);
   const [togglingToolKey, setTogglingToolKey] = useState<string | null>(null);
   const [togglingTarget, setTogglingTarget] = useState<{ skillId: string; tool: string } | null>(null);
@@ -796,6 +800,9 @@ export function MySkills() {
     setBatchProgress({ done: 0, total: ids.length });
     try {
       const result = await api.batchUpdateSkills(ids);
+      if (result.new_skills.length > 0) {
+        setNewSkills(result.new_skills);
+      }
       if (result.cancelled) {
         toast.info(t("mySkills.batchUpdateCancelled", { count: result.refreshed }));
       }
@@ -847,6 +854,34 @@ export function MySkills() {
       setBatchUpdating(false);
       setBatchProgress(null);
     }
+  };
+
+  const installChosenNewSkills = async (chosen: api.NewSkill[]) => {
+    if (chosen.length === 0) return;
+    setInstallingNew(true);
+    try {
+      for (const skill of chosen) {
+        const tree = skill.branch
+          ? `${skill.source_ref_resolved}/tree/${skill.branch}/${skill.subpath}`
+          : `${skill.source_ref_resolved}/tree/${skill.subpath}`;
+        await api.installGit(tree);
+      }
+      toast.success(t("mySkills.newSkills.installed", { count: chosen.length }));
+    } catch (error: unknown) {
+      toast.error(getErrorMessage(error, t("common.error")));
+    } finally {
+      setInstallingNew(false);
+      setNewSkills([]);
+      await refreshManagedSkills();
+    }
+  };
+
+  const dismissOfferedNewSkills = (offered: api.NewSkill[]) => {
+    setNewSkills([]);
+    // Remembered so the next round does not ask about the same ones again.
+    void api
+      .dismissNewSkills(offered.map((skill) => `${skill.source_ref_resolved}#${skill.subpath}`))
+      .catch((error: unknown) => console.error("Failed to remember dismissal:", error));
   };
 
   const handleBatchRefresh = () => {
@@ -2268,6 +2303,13 @@ export function MySkills() {
           }
         }}
       />
+      <NewSkillsDialog
+        skills={newSkills}
+        installing={installingNew}
+        onInstall={installChosenNewSkills}
+        onDismiss={dismissOfferedNewSkills}
+      />
+
       <ConfirmDialog
         open={batchDeleteConfirm}
         message={t("mySkills.batchDeleteConfirm", { count: selectedIds.size })}

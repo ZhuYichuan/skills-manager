@@ -1890,6 +1890,71 @@ pub async fn reimport_local_skill(
     .await?
 }
 
+/// Settings key holding the new skills the user has said no to, as
+/// `"<source>#<subpath>"`. A prompt that returns every round is a prompt the
+/// user learns to dismiss without reading.
+const DISMISSED_NEW_SKILLS: &str = "dismissed_new_skills";
+
+fn dismissed_new_skills(store: &SkillStore) -> HashSet<String> {
+    store
+        .get_setting(DISMISSED_NEW_SKILLS)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .map(|keys| keys.into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// Remember the refusals so the next round does not ask again.
+fn remember_dismissed_new_skills(
+    store: &SkillStore,
+    keys: Vec<String>,
+) -> Result<(), AppError> {
+    let mut current = dismissed_new_skills(store);
+    let before = current.len();
+    current.extend(keys);
+    if current.len() == before {
+        return Ok(());
+    }
+    let mut all: Vec<String> = current.into_iter().collect();
+    all.sort();
+    store
+        .set_setting(
+            DISMISSED_NEW_SKILLS,
+            &serde_json::to_string(&all).unwrap_or_default(),
+        )
+        .map_err(AppError::db)
+}
+
+fn new_skill_key(source: &str, subpath: &str) -> String {
+    format!("{source}#{subpath}")
+}
+
+/// Every subpath the library already holds, per Source. Read once per round
+/// rather than once per group: the scan needs the whole Source's inventory to
+/// tell a new skill from an installed one.
+fn installed_subpaths_by_source(store: &SkillStore) -> HashMap<String, Vec<String>> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    if let Ok(skills) = store.get_all_skills() {
+        for skill in skills {
+            if let (Some(source), Some(subpath)) = (skill.source_ref_resolved, skill.source_subpath) {
+                out.entry(source).or_default().push(subpath);
+            }
+        }
+    }
+    out
+}
+
+/// Stop offering these skills. The round filters them out from then on, until
+/// the Source drops that subpath and adds it again.
+#[tauri::command]
+pub fn dismiss_new_skills(
+    keys: Vec<String>,
+    store: State<'_, Arc<SkillStore>>,
+) -> Result<(), AppError> {
+    remember_dismissed_new_skills(store.inner(), keys)
+}
+
 /// Split a batch into one group per Source, keeping the caller's order.
 ///
 /// Skills that cannot be tied to a remote (local, imported, or a broken source
@@ -2070,6 +2135,10 @@ pub fn run_update_round(
         return Ok(tally.into_result(true));
     }
 
+    let installed = installed_subpaths_by_source(store);
+    let dismissed = dismissed_new_skills(store);
+    let mut new_skills: Vec<NewSkill> = Vec::new();
+
     let (groups, ungrouped) = group_by_source(loaded);
     // Local and imported sources share nothing and have no remote to
     // resolve, so they keep re-importing one at a time, as they always did.
@@ -2137,6 +2206,7 @@ pub fn run_update_round(
         // The first checkout of a Source is where the revision comes from;
         // every later one reuses it rather than asking the remote again.
         let mut head: Option<String> = None;
+        let mut scanned: Option<std::path::PathBuf> = None;
         for at in refreshing {
             let (skill_id, skill) = &members[at];
             let outcome = prepare_update(
@@ -2149,6 +2219,9 @@ pub fn run_update_round(
             );
             if let Ok(prepared_update) = &outcome {
                 head = Some(prepared_update.revision.clone());
+                if scanned.is_none() {
+                    scanned = Some(prepared_update.checkout.clone());
+                }
             }
             prepared[at] = Some(outcome);
         }
@@ -2171,6 +2244,28 @@ pub fn run_update_round(
             );
             for (at, outcome) in fetched {
                 prepared[at] = Some(outcome);
+            }
+        }
+
+        // The checkout is on disk for the length of this group: the cheapest
+        // moment there will ever be to see which skills the Source gained.
+        if let Some(checkout) = &scanned {
+            if let Some((_, any_member)) = members.first() {
+                if let Ok(source) = RemoteRef::from_skill(any_member) {
+                    let held = installed.get(&source.clone_url).cloned().unwrap_or_default();
+                    for found in source_membership::discover(checkout, &held) {
+                        let key = new_skill_key(&source.clone_url, &found.subpath);
+                        if dismissed.contains(&key) {
+                            continue;
+                        }
+                        new_skills.push(NewSkill {
+                            name: found.name,
+                            subpath: found.subpath,
+                            source_ref_resolved: source.clone_url.clone(),
+                            branch: source.branch.clone(),
+                        });
+                    }
+                }
             }
         }
 
@@ -2750,6 +2845,16 @@ pub async fn repoint_skill_source(
 /// Holding the central-repo lock across a network round-trip is what made
 /// unrelated foreground operations fail with a 20s "repository is busy" (#315),
 /// so the fetch happens here and [`apply_prepared_update`] only writes.
+/// A skill a Source now holds that the library does not.
+#[derive(Debug, Clone, Serialize)]
+pub struct NewSkill {
+    pub name: String,
+    /// Where it sits in the repository, ready to be turned into a tree URL.
+    pub subpath: String,
+    pub source_ref_resolved: String,
+    pub branch: Option<String>,
+}
+
 pub struct PreparedUpdate {
     pub source: RemoteRef,
     pub revision: String,
@@ -4610,6 +4715,19 @@ mod tests {
 
     /// The whole point of the batch grouping: skills installed from different
     /// subdirectories of one repository share a single resolution and fetch.
+    #[test]
+    fn a_refused_new_skill_is_not_offered_again() {
+        let repo = test_repo();
+        let key = new_skill_key("https://example.com/acme/skills.git", "skills/fresh");
+
+        remember_dismissed_new_skills(&repo.store, vec![key.clone()]).unwrap();
+        assert!(dismissed_new_skills(&repo.store).contains(&key));
+
+        // Refusing twice is not two entries.
+        remember_dismissed_new_skills(&repo.store, vec![key.clone()]).unwrap();
+        assert_eq!(dismissed_new_skills(&repo.store).len(), 1);
+    }
+
     #[test]
     fn a_batch_asks_each_source_once() {
         let loaded = vec![

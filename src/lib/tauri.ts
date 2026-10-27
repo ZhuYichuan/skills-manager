@@ -365,6 +365,14 @@ export const updateSkill = (skillId: string, approvedRemovals?: string | null) =
 export const repointSkillSource = (skillId: string, subpath: string) =>
   invoke<ManagedSkill>("repoint_skill_source", { skillId, subpath });
 
+export interface NewSkill {
+  name: string;
+  /** Where it sits in the repository, used to build the tree URL it installs from. */
+  subpath: string;
+  source_ref_resolved: string;
+  branch: string | null;
+}
+
 export interface BatchUpdateSkillsResult {
   refreshed: number;
   unchanged: number;
@@ -377,6 +385,8 @@ export interface BatchUpdateSkillsResult {
   held_back_paths: number;
   /** Skills their Source still has, but no longer at the recorded path. */
   moved_sources: MovedSource[];
+  /** Skills the Sources now hold that the library does not. Never installed automatically. */
+  new_skills: NewSkill[];
   /** Skills their Source no longer has anywhere. */
   gone_sources: string[];
 }
@@ -402,6 +412,10 @@ export const batchUpdateSkills = (skillIds: string[]) =>
 
 /** Stop a running batch update. Skills already finished stay finished. */
 export const cancelBatchUpdate = () => invoke<boolean>("cancel_batch_update");
+
+/** Stop offering these discovered skills; the next round filters them out. */
+export const dismissNewSkills = (keys: string[]) =>
+  invoke<void>("dismiss_new_skills", { keys });
 
 export interface ReimportSkillResult {
   skill: ManagedSkill;

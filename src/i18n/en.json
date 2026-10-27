@@ -439,6 +439,13 @@
       "tagDeleted": "Tag deleted",
       "deleteConfirm": "Remove the tag \"{{tag}}\" from all skills?"
     },
+      "newSkills": {
+        "title": "{{count}} new skill(s) in your sources",
+        "hint": "Your library does not have these yet. Nothing is installed until you pick one.",
+        "install": "Install {{count}}",
+        "notNow": "Not now",
+        "installed": "{{count}} skill(s) installed"
+      },
     "selectMode": "Select",
     "selectedCount": "{{count}} selected",
     "selectHint": "Click skills to select",
