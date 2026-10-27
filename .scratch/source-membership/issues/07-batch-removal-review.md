@@ -4,7 +4,7 @@
 
 **Blocked by:** 无（ticket 05/06 已合并，审批模型已存在）
 
-**Status:** ready-for-agent
+**Status:** done (bd56121, 7ea2971)
 
 ## 现状
 
